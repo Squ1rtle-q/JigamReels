@@ -165,6 +165,9 @@ def generate_srt_from_whisper(
     Raises:
         RuntimeError: Если не удалось загрузить модель Whisper
     """
+    # Количество слов, которые показываются в одном "шаге" субтитра.
+    words_per_line = max(1, int(words_per_line or 1))
+
     # Определяем язык для транскрипции
     if language != 'Auto-detect':
         lang_code = LANGUAGE_NAME_TO_CODE.get(language.lower(), language.lower())
@@ -190,16 +193,32 @@ def generate_srt_from_whisper(
     for segment in normalized_segments:
         words = segment.get('words') or []
         if not words:
-            start_time = _format_time(segment.get('start', 0))
-            end_time = _format_time(segment.get('end', segment.get('start', 0) + 2))
+            # Для fallback-веток без word timestamps разбиваем фразу по словам
+            # и равномерно делим длительность сегмента, чтобы текст появлялся поочередно.
+            seg_start = float(segment.get('start', 0.0))
+            seg_end = float(segment.get('end', seg_start + 2.0))
             text = (segment.get('text') or '').strip()
             if not text:
                 continue
 
-            srt_content += f"{sub_index}\n"
-            srt_content += f"{start_time} --> {end_time}\n"
-            srt_content += f"{text}\n\n"
-            sub_index += 1
+            plain_words = [w for w in text.split() if w.strip()]
+            if not plain_words:
+                continue
+
+            duration = max(0.25, seg_end - seg_start)
+            chunk_count = max(1, (len(plain_words) + words_per_line - 1) // words_per_line)
+            chunk_dur = duration / chunk_count
+
+            for idx in range(chunk_count):
+                chunk = plain_words[idx * words_per_line:(idx + 1) * words_per_line]
+                if not chunk:
+                    continue
+                c_start = seg_start + idx * chunk_dur
+                c_end = seg_end if idx == chunk_count - 1 else min(seg_end, c_start + chunk_dur)
+                srt_content += f"{sub_index}\n"
+                srt_content += f"{_format_time(c_start)} --> {_format_time(c_end)}\n"
+                srt_content += f"{' '.join(chunk)}\n\n"
+                sub_index += 1
             continue
 
         num_words = len(words)

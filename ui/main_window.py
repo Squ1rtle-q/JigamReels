@@ -6,6 +6,7 @@ import uuid
 import shutil
 import logging
 import copy
+from typing import Optional, Tuple
 
 from PyQt5.QtCore import Qt, QPoint, pyqtSignal, QThread
 from PyQt5.QtGui import (
@@ -18,7 +19,7 @@ from PyQt5.QtWidgets import (
     QMessageBox, QProgressBar, QComboBox, QGroupBox, QRadioButton,
     QButtonGroup, QCheckBox, QSplitter, QListWidgetItem, QTabWidget,
     QMenu, QFrame, QStackedWidget, QInputDialog, QPlainTextEdit, QColorDialog,
-    QSlider, QApplication
+    QSlider, QApplication, QSizePolicy, QScrollArea
 )
 
 import qtawesome as qta
@@ -29,7 +30,15 @@ from utils.constants import (
     FILTERS, OVERLAY_POSITIONS, REELS_FORMAT_NAME, OUTPUT_FORMATS,
     CODECS, WHISPER_MODELS, WHISPER_LANGUAGES, APP_NAME, APP_VERSION
 )
-from utils.ffmpeg_utils import generate_preview, get_video_duration, detect_crop_dimensions
+from utils.ffmpeg_utils import (
+    generate_preview,
+    get_video_duration,
+    detect_crop_dimensions,
+    get_video_dimensions,
+    reels_preview_bars_heights,
+    _ass_font_size_for_video,
+    _subtitle_effective_outline,
+)
 from utils.youtube_utils import download_video
 from uploader_ui.uploader_widget import UploaderWidget
 from utils.path_utils import resource_path
@@ -147,6 +156,9 @@ class ProcessingWidgetContent(QWidget):
         self.preview_thread = None
         self.processing_thread = None
         self.last_output_path = None
+        self._preview_signature = None
+        self._preview_signature_pending = None
+        self._preview_frame_pixmap = None
         self.init_ui()
     
     def init_ui(self):
@@ -229,7 +241,12 @@ class ProcessingWidgetContent(QWidget):
         # Создание вкладок
         main_tab = QWidget()
         transform_tab = QWidget()
-        effects_tab = QWidget()
+        effects_tab = QScrollArea()
+        effects_tab.setWidgetResizable(True)
+        effects_tab.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        effects_tab.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        effects_tab_content = QWidget()
+        effects_tab.setWidget(effects_tab_content)
         audio_tab = QWidget()
         
         tab_widget.addTab(main_tab, 'Меню')
@@ -240,7 +257,7 @@ class ProcessingWidgetContent(QWidget):
         # Layouts для вкладок
         main_tab_layout = QVBoxLayout(main_tab)
         transform_tab_layout = QVBoxLayout(transform_tab)
-        effects_tab_layout = QVBoxLayout(effects_tab)
+        effects_tab_layout = QVBoxLayout(effects_tab_content)
         audio_tab_layout = QVBoxLayout(audio_tab)
         
         # === ГЛАВНАЯ ВКЛАДКА ===
@@ -501,6 +518,18 @@ class ProcessingWidgetContent(QWidget):
         row_pos.addWidget(self.overlay_pos_combo)
         row_pos.addStretch()
         ov_lay.addLayout(row_pos)
+
+        row_overlay_scale = QHBoxLayout()
+        self.overlay_scale_slider = QSlider(Qt.Horizontal)
+        self.overlay_scale_slider.setRange(10, 300)
+        self.overlay_scale_slider.setValue(100)
+        self.overlay_scale_label = QLabel('Масштаб баннера: 100%')
+        self.overlay_scale_slider.valueChanged.connect(
+            lambda v: self.overlay_scale_label.setText(f'Масштаб баннера: {v}%')
+        )
+        row_overlay_scale.addWidget(self.overlay_scale_label)
+        row_overlay_scale.addWidget(self.overlay_scale_slider, 1)
+        ov_lay.addLayout(row_overlay_scale)
         
         effects_tab_layout.addWidget(self.overlay_group)
         
@@ -565,12 +594,15 @@ class ProcessingWidgetContent(QWidget):
         whisper_row2.addWidget(self.subs_lang_combo)
         subs_whisper_layout.addLayout(whisper_row2)
         
-        # Слова в строке
+        # Слов за одно появление субтитра
         whisper_row3 = QHBoxLayout()
-        whisper_row3.addWidget(QLabel('Слов в строке:'))
+        whisper_row3.addWidget(QLabel('Слов за раз:'))
         self.subs_words_spin = QSpinBox()
-        self.subs_words_spin.setRange(1, 10)
-        self.subs_words_spin.setValue(4)
+        self.subs_words_spin.setRange(1, 14)
+        self.subs_words_spin.setValue(2)
+        self.subs_words_spin.setToolTip(
+            'Сколько слов показывать одновременно. 1–2 = поочередное появление, как вы просили.'
+        )
         whisper_row3.addWidget(self.subs_words_spin)
         whisper_row3.addStretch()
         subs_whisper_layout.addLayout(whisper_row3)
@@ -634,16 +666,74 @@ class ProcessingWidgetContent(QWidget):
         subs_color_layout.addStretch()
         subs_main_layout.addLayout(subs_color_layout)
 
+        self.subs_position_combo = QComboBox()
+        _subs_pos_pairs = [
+            ('Внизу слева', 1),
+            ('Внизу по центру', 2),
+            ('Внизу справа', 3),
+            ('По центру слева', 4),
+            ('По центру', 5),
+            ('По центру справа', 6),
+            ('Вверху слева', 7),
+            ('Вверху по центру', 8),
+            ('Вверху справа', 9),
+        ]
+        for _lbl, _aid in _subs_pos_pairs:
+            self.subs_position_combo.addItem(_lbl, _aid)
+        self.subs_position_combo.setCurrentIndex(1)
+        self.subs_position_combo.setToolTip(
+            'Для рилсов чаще выбирайте «Внизу…», чтобы не закрывать лица и центр кадра.'
+        )
+        self.subs_margin_v_spin = QSpinBox()
+        self.subs_margin_v_spin.setRange(-600, 1200)
+        self.subs_margin_v_spin.setValue(110)
+        self.subs_margin_v_spin.setToolTip(
+            'ASS MarginV: для «Внизу…» положительные — выше от низа; отрицательные — ближе к самому низу/в полосу размытия. '
+            'Для «Вверху…» наоборот: минус — ближе к верху кадра.'
+        )
+        self.subs_margin_lr_spin = QSpinBox()
+        self.subs_margin_lr_spin.setRange(0, 350)
+        self.subs_margin_lr_spin.setValue(28)
+        self.subs_margin_lr_spin.setToolTip('Поля MarginL и MarginR')
+
         # Превью стиля субтитров
         preview_group = QGroupBox('Превью субтитров')
         preview_layout = QVBoxLayout(preview_group)
         self.subs_style_preview = QLabel('Это пример того, как будут выглядеть субтитры')
         self.subs_style_preview.setAlignment(Qt.AlignCenter)
         self.subs_style_preview.setWordWrap(True)
-        self.subs_style_preview.setMinimumHeight(90)
+        self.subs_style_preview.setMinimumHeight(120)
+        self.subs_style_preview.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.MinimumExpanding)
         self.subs_style_preview.setStyleSheet('background: #FFFFFF; color: #000000; border: 1px solid #999;')
         preview_layout.addWidget(self.subs_style_preview)
         subs_main_layout.addWidget(preview_group)
+
+        frame_preview_group = QGroupBox('Как на видео (9:16)')
+        frame_preview_layout = QVBoxLayout(frame_preview_group)
+        self.subs_on_frame_preview = QLabel()
+        self.subs_on_frame_preview.setAlignment(Qt.AlignCenter)
+        self.subs_on_frame_preview.setMinimumWidth(220)
+        self.subs_on_frame_preview.setStyleSheet('background: #1a1a1e; border: 1px solid #555;')
+        frame_preview_layout.addWidget(self.subs_on_frame_preview)
+
+        frame_pos_row1 = QHBoxLayout()
+        frame_pos_row1.addWidget(QLabel('Положение:'))
+        frame_pos_row1.addWidget(self.subs_position_combo, 1)
+        frame_preview_layout.addLayout(frame_pos_row1)
+        frame_pos_row2 = QHBoxLayout()
+        frame_pos_row2.addWidget(QLabel('Отступ сверху/снизу:'))
+        frame_pos_row2.addWidget(self.subs_margin_v_spin)
+        frame_pos_row2.addSpacing(16)
+        frame_pos_row2.addWidget(QLabel('Слева/справа:'))
+        frame_pos_row2.addWidget(self.subs_margin_lr_spin)
+        frame_pos_row2.addStretch()
+        frame_preview_layout.addLayout(frame_pos_row2)
+
+        self.subs_on_frame_hint = QLabel('')
+        self.subs_on_frame_hint.setWordWrap(True)
+        self.subs_on_frame_hint.setStyleSheet('color: #888; font-size: 11px;')
+        frame_preview_layout.addWidget(self.subs_on_frame_hint)
+        subs_main_layout.addWidget(frame_preview_group)
         
         effects_tab_layout.addWidget(self.subs_group)
         effects_tab_layout.addStretch()
@@ -777,12 +867,25 @@ class ProcessingWidgetContent(QWidget):
         self.subs_size_spin.valueChanged.connect(self.update_subtitle_style_preview)
         self.subs_outline_spin.valueChanged.connect(self.update_subtitle_style_preview)
         self.subs_outline_mode_combo.currentTextChanged.connect(self.update_subtitle_style_preview)
+        self.subs_position_combo.currentIndexChanged.connect(self.update_subtitle_style_preview)
+        self.subs_margin_v_spin.valueChanged.connect(self.update_subtitle_style_preview)
+        self.subs_margin_lr_spin.valueChanged.connect(self.update_subtitle_style_preview)
+        self.video_list_widget.itemSelectionChanged.connect(self.update_subtitle_on_video_preview)
+        self.auto_crop_checkbox.stateChanged.connect(self.update_subtitle_on_video_preview)
+        self.zoom_static_spin.valueChanged.connect(self.update_subtitle_on_video_preview)
+        self.zoom_min_spin.valueChanged.connect(self.update_subtitle_on_video_preview)
+        self.zoom_max_spin.valueChanged.connect(self.update_subtitle_on_video_preview)
         browse_ol_audio_btn.clicked.connect(self.on_browse_overlay_audio)
         clear_ol_audio_btn.clicked.connect(self.overlay_audio_path_edit.clear)
         self.process_button.clicked.connect(self.start_processing)
         btn_preset_save.clicked.connect(self.on_save_preset)
         btn_preset_apply.clicked.connect(self.on_apply_preset)
         btn_preset_delete.clicked.connect(self.on_delete_preset)
+        self.filter_list.itemSelectionChanged.connect(self.update_subtitle_on_video_preview)
+        self.blur_background_checkbox.stateChanged.connect(self.update_subtitle_on_video_preview)
+        self.overlay_path.textChanged.connect(self.update_subtitle_on_video_preview)
+        self.overlay_pos_combo.currentTextChanged.connect(self.update_subtitle_on_video_preview)
+        self.overlay_scale_slider.valueChanged.connect(self.update_subtitle_on_video_preview)
         
         # Инициализация состояний
         self.on_subs_mode_changed()
@@ -859,6 +962,71 @@ class ProcessingWidgetContent(QWidget):
             'underline': 'подчеркнутый' in style
         }
 
+    def _paint_subtitle_sample(
+        self,
+        painter: QPainter,
+        x: float,
+        y: float,
+        font: QFont,
+        text: str,
+        text_color: str,
+        outline_color: str,
+        outline: int,
+        outline_mode: str,
+    ):
+        painter.setFont(font)
+        path = QPainterPath()
+        path.addText(x, y, font, text)
+        if outline > 0:
+            pen = QPen(QColor(outline_color))
+            pen.setJoinStyle(Qt.RoundJoin)
+            pen.setWidth(max(1, outline * 2))
+            if outline_mode == 'Снаружи':
+                painter.setPen(pen)
+                painter.setBrush(Qt.NoBrush)
+                painter.drawPath(path)
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(QColor(text_color))
+                painter.drawPath(path)
+            else:
+                painter.setPen(pen)
+                painter.setBrush(QColor(text_color))
+                painter.drawPath(path)
+        else:
+            painter.setPen(QColor(text_color))
+            painter.drawText(int(x), int(y), text)
+
+    def _subtitle_preview_xy(
+        self,
+        alignment: int,
+        margin_lr: int,
+        margin_v: int,
+        pixmap_w: int,
+        pixmap_h: int,
+        text_w: int,
+        fm,
+    ):
+        """Координаты текста для превью (как в ASS: 1–9)."""
+        ascent = fm.ascent()
+        descent = fm.descent()
+        if alignment in (1, 2, 3):
+            y = float(pixmap_h - margin_v - descent)
+        elif alignment in (7, 8, 9):
+            y = float(margin_v + ascent)
+        else:
+            y = float(pixmap_h / 2.0 + (ascent - descent) / 2.0)
+
+        if alignment in (1, 4, 7):
+            x = float(margin_lr)
+        elif alignment in (2, 5, 8):
+            x = (pixmap_w - text_w) / 2.0
+        else:
+            x = float(pixmap_w - text_w - margin_lr)
+
+        max_x = float(max(0, pixmap_w - text_w - margin_lr))
+        x = max(float(margin_lr), min(x, max_x))
+        return x, y
+
     def update_subtitle_style_preview(self):
         font_family = self.subs_font_combo.currentText().strip() or 'Arial'
         font_size = self.subs_size_spin.value()
@@ -866,17 +1034,56 @@ class ProcessingWidgetContent(QWidget):
         outline_color = self.subs_outline_color_hex
         outline = self.subs_outline_spin.value()
         outline_mode = self.subs_outline_mode_combo.currentText()
+        al_raw = self.subs_position_combo.currentData()
+        try:
+            alignment = int(al_raw) if al_raw is not None else 2
+        except (TypeError, ValueError):
+            alignment = 2
+        margin_v = self.subs_margin_v_spin.value()
+        margin_lr = self.subs_margin_lr_spin.value()
         font_flags = self._subtitle_font_flags()
-        font = QFont(font_family, font_size)
-        font.setBold(font_flags['bold'])
-        font.setItalic(font_flags['italic'])
-        font.setUnderline(font_flags['underline'])
 
         self.subs_style_preview.setStyleSheet('background: #FFFFFF; border: 1px solid #999;')
         self.subs_style_preview.setText('')
 
-        pixmap_w = max(320, self.subs_style_preview.width() - 4)
-        pixmap_h = max(90, self.subs_style_preview.height() - 4)
+        preview_text = 'Это пример того, как будут выглядеть субтитры'
+        H_ref = 1920
+        ass_px_ref = int(_ass_font_size_for_video(font_size, H_ref))
+
+        widget_w = self.subs_style_preview.width()
+        widget_h = self.subs_style_preview.height()
+        if widget_w < 80:
+            widget_w = 420
+        if widget_h < 80:
+            widget_h = 140
+
+        pixmap_h_est = max(90, widget_h - 4)
+        scale_est = max(0.12, min(1.0, pixmap_h_est / float(H_ref)))
+        margin_v_est = int(round(margin_v * scale_est))
+        f_est = QFont(font_family)
+        f_est.setPixelSize(max(6, int(round(ass_px_ref * scale_est))))
+        f_est.setBold(font_flags['bold'])
+        f_est.setItalic(font_flags['italic'])
+        line_h_est = QFontMetrics(f_est).height()
+        if alignment in (1, 2, 3, 7, 8, 9):
+            min_h_needed = margin_v_est + line_h_est + 24
+        else:
+            min_h_needed = line_h_est + 80
+        pixmap_h = max(90, min_h_needed, widget_h - 4)
+        scale_preview = max(0.12, min(1.0, pixmap_h / float(H_ref)))
+        margin_v_s = int(round(margin_v * scale_preview))
+        margin_lr_s = int(round(margin_lr * scale_preview))
+
+        font = QFont(font_family)
+        font.setPixelSize(max(6, int(round(ass_px_ref * scale_preview))))
+        font.setBold(font_flags['bold'])
+        font.setItalic(font_flags['italic'])
+        font.setUnderline(font_flags['underline'])
+        fm = QFontMetrics(font)
+        text_w = fm.horizontalAdvance(preview_text)
+        min_w_needed = max(280, text_w + 2 * margin_lr_s + 24)
+        pixmap_w = max(min_w_needed, widget_w - 4, 280)
+
         pixmap = QPixmap(pixmap_w, pixmap_h)
         pixmap.fill(Qt.white)
 
@@ -885,39 +1092,206 @@ class ProcessingWidgetContent(QWidget):
         painter.setRenderHint(QPainter.TextAntialiasing, True)
         painter.setFont(font)
 
-        preview_text = 'Это пример того, как будут выглядеть субтитры'
-        fm = painter.fontMetrics()
-        text_w = fm.horizontalAdvance(preview_text)
-        text_h = fm.height()
-        x = (pixmap_w - text_w) / 2
-        y = (pixmap_h + text_h * 0.35) / 2
-
-        path = QPainterPath()
-        path.addText(x, y, font, preview_text)
-
-        if outline > 0:
-            pen = QPen(QColor(outline_color))
-            pen.setJoinStyle(Qt.RoundJoin)
-            pen.setWidth(max(1, outline * 2))
-            if outline_mode == 'Снаружи':
-                # Сначала контур, потом заливка: текст не "съедается" изнутри.
-                painter.setPen(pen)
-                painter.setBrush(Qt.NoBrush)
-                painter.drawPath(path)
-                painter.setPen(Qt.NoPen)
-                painter.setBrush(QColor(text_color))
-                painter.drawPath(path)
-            else:
-                # Внутренний контур: более плотный "жирный" вид букв.
-                painter.setPen(pen)
-                painter.setBrush(QColor(text_color))
-                painter.drawPath(path)
-        else:
-            painter.setPen(QColor(text_color))
-            painter.drawText(int(x), int(y), preview_text)
-
+        x, y = self._subtitle_preview_xy(
+            alignment, margin_lr_s, margin_v_s, pixmap_w, pixmap_h, text_w, fm
+        )
+        eff_outline = _subtitle_effective_outline({
+            'outline': outline,
+            'outline_mode': outline_mode.lower(),
+        })
+        eff_outline_draw = max(1, int(round(eff_outline * scale_preview))) if eff_outline > 0 else eff_outline
+        self._paint_subtitle_sample(
+            painter, x, y, font, preview_text,
+            text_color, outline_color, eff_outline_draw, outline_mode
+        )
         painter.end()
         self.subs_style_preview.setPixmap(pixmap)
+        self.update_subtitle_on_video_preview()
+
+    def _subs_preview_zoom_p(self) -> int:
+        if self.zoom_dynamic_radio.isChecked():
+            return (self.zoom_min_spin.value() + self.zoom_max_spin.value()) // 2
+        return self.zoom_static_spin.value()
+
+    def _subs_preview_video_path(self):
+        selected = self.video_list_widget.selectedItems()
+        if selected:
+            p = selected[0].data(Qt.UserRole)
+            if p and os.path.isfile(p):
+                return p
+        if self.video_list_widget.count() > 0:
+            p = self.video_list_widget.item(0).data(Qt.UserRole)
+            if p and os.path.isfile(p):
+                return p
+        return None
+
+    def _collect_preview_signature(
+        self, video_path: Optional[str], crop_filter: Optional[str]
+    ) -> Optional[Tuple]:
+        if not video_path or not os.path.isfile(video_path):
+            return None
+        vp = os.path.normcase(os.path.normpath(os.path.abspath(video_path)))
+        cf = (crop_filter or '').replace(' ', '')
+        filters = tuple(sorted(it.text() for it in self.filter_list.selectedItems()))
+        ov_raw = self.overlay_path.text().strip()
+        if ov_raw and os.path.isfile(ov_raw):
+            ov = os.path.normcase(os.path.normpath(os.path.abspath(ov_raw)))
+        else:
+            ov = ''
+        return (
+            vp,
+            cf,
+            filters,
+            int(self._subs_preview_zoom_p()),
+            ov,
+            self.overlay_pos_combo.currentText(),
+            int(self.overlay_scale_slider.value()),
+            self.output_format_combo.currentText(),
+            bool(self.blur_background_checkbox.isChecked()),
+            bool(self.auto_crop_checkbox.isChecked()),
+        )
+
+    def update_subtitle_on_video_preview(self):
+        """Тот же кадр, что после «Обновить предпросмотр», плюс субтитры в пикселях как при вшивании."""
+        if not hasattr(self, 'subs_on_frame_preview'):
+            return
+
+        W_def, H_def = 1080, 1920
+        path = self._subs_preview_video_path()
+        cached = getattr(self, '_subs_frame_dim_cache', None)
+        if cached is None or cached[0] != path:
+            if path:
+                w, h = get_video_dimensions(path)
+                wh = (w, h) if w > 0 and h > 0 else (1920, 1080)
+            else:
+                wh = (1920, 1080)
+            self._subs_frame_dim_cache = (path, wh)
+        sw, sh = self._subs_frame_dim_cache[1]
+
+        crop_filter = None
+        if self.auto_crop_checkbox.isChecked() and path:
+            try:
+                mt = os.path.getmtime(path)
+            except OSError:
+                mt = 0.0
+            ck = (path, mt)
+            if getattr(self, '_subs_preview_crop_key', None) != ck:
+                try:
+                    self._subs_preview_crop_val = detect_crop_dimensions(path)
+                except Exception:
+                    self._subs_preview_crop_val = None
+                self._subs_preview_crop_key = ck
+            crop_filter = getattr(self, '_subs_preview_crop_val', None)
+
+        zoom_p = self._subs_preview_zoom_p()
+        is_reels = self.output_format_combo.currentText() == REELS_FORMAT_NAME
+        letterbox_inset = 0
+        _, bar = float(H_def), 0.0
+        if is_reels:
+            _, bar, letterbox_inset = reels_preview_bars_heights(sw, sh, crop_filter, zoom_p)
+
+        al_raw = self.subs_position_combo.currentData()
+        try:
+            alignment = int(al_raw) if al_raw is not None else 2
+        except (TypeError, ValueError):
+            alignment = 2
+        margin_v_base = self.subs_margin_v_spin.value()
+        margin_lr = self.subs_margin_lr_spin.value()
+        margin_v = margin_v_base
+        if is_reels and letterbox_inset > 0 and alignment in (1, 2, 3, 7, 8, 9):
+            margin_v = margin_v_base + letterbox_inset
+
+        font_family = self.subs_font_combo.currentText().strip() or 'Arial'
+        font_flags = self._subtitle_font_flags()
+        preview_text = 'Пример субтитров на кадре'
+
+        current_sig = self._collect_preview_signature(path, crop_filter) if path else None
+        use_real_frame = (
+            current_sig is not None
+            and self._preview_signature == current_sig
+            and self._preview_frame_pixmap is not None
+            and not self._preview_frame_pixmap.isNull()
+        )
+
+        if use_real_frame:
+            canvas = QPixmap(self._preview_frame_pixmap)
+            W0, H0 = canvas.width(), canvas.height()
+        else:
+            canvas = QPixmap(W_def, H_def)
+            canvas.fill(QColor(26, 26, 30))
+            W0, H0 = W_def, H_def
+            p0 = QPainter(canvas)
+            p0.setRenderHint(QPainter.Antialiasing, True)
+            if is_reels and bar > 0.5:
+                bh = int(max(1, round(bar)))
+                fh = max(1, H0 - 2 * bh)
+                p0.fillRect(0, 0, W0, bh, QColor(38, 40, 48))
+                p0.fillRect(0, bh, W0, fh, QColor(72, 78, 98))
+                p0.fillRect(0, bh + fh, W0, H0 - bh - fh, QColor(38, 40, 48))
+            else:
+                p0.fillRect(0, 0, W0, H0, QColor(55, 62, 80))
+            p0.end()
+
+        ass_px = int(_ass_font_size_for_video(self.subs_size_spin.value(), H0))
+        font = QFont(font_family)
+        font.setPixelSize(max(6, ass_px))
+        font.setBold(font_flags['bold'])
+        font.setItalic(font_flags['italic'])
+        font.setUnderline(font_flags['underline'])
+        f_meas = QFont(font_family)
+        f_meas.setPixelSize(max(8, ass_px))
+        f_meas.setBold(font_flags['bold'])
+        f_meas.setItalic(font_flags['italic'])
+        f_meas.setUnderline(font_flags['underline'])
+        fm_log = QFontMetrics(f_meas)
+        text_w_log = fm_log.horizontalAdvance(preview_text)
+        x0, y0 = self._subtitle_preview_xy(
+            alignment, margin_lr, margin_v, W0, H0, text_w_log, fm_log
+        )
+
+        painter = QPainter(canvas)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.setRenderHint(QPainter.TextAntialiasing, True)
+        eff_ol = _subtitle_effective_outline({
+            'outline': self.subs_outline_spin.value(),
+            'outline_mode': self.subs_outline_mode_combo.currentText().lower(),
+        })
+        self._paint_subtitle_sample(
+            painter, x0, y0, font, preview_text,
+            self.subs_text_color_hex, self.subs_outline_color_hex,
+            eff_ol, self.subs_outline_mode_combo.currentText(),
+        )
+        painter.end()
+
+        panel_w = max(200, min(360, self.subs_on_frame_preview.width() - 4))
+        if self.subs_on_frame_preview.width() < 100:
+            panel_w = 270
+        s = panel_w / float(W0)
+        disp_w = int(round(W0 * s))
+        disp_h = int(round(H0 * s))
+        final_pix = canvas.scaled(disp_w, disp_h, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        self.subs_on_frame_preview.setPixmap(final_pix)
+        self.subs_on_frame_preview.setFixedHeight(final_pix.height())
+
+        if use_real_frame:
+            self.subs_on_frame_hint.setText(
+                'Кадр совпадает с последним «Обновить предпросмотр» (формат, зум, размытие, фильтры, баннер, автообрезка). '
+                'Размер и отступы субтитров — как при вшивании в пикселях кадра.'
+            )
+        else:
+            self.subs_on_frame_hint.setText(
+                'Нажмите «Обновить предпросмотр» на основной вкладке с выбранным видео — здесь будет тот же кадр с эффектами. '
+                'Пока схема полос Reels или условный фон; разметка субтитров (в т.ч. сдвиг при зуме) как при кодировании.'
+            )
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.update_subtitle_style_preview()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, 'subs_on_frame_preview') and self.isVisible():
+            self.update_subtitle_on_video_preview()
     
     def on_add_from_youtube(self):
         url = self.yt_url_input.text().strip()
@@ -973,13 +1347,16 @@ class ProcessingWidgetContent(QWidget):
                 self.on_preview_error(f'Не удалось определить размеры обрезки: {e}')
                 return
         
+        self._preview_signature_pending = self._collect_preview_signature(in_path, crop_filter)
+
         params = {
             'in_path': in_path,
             'out_path': temp_preview_path,
             'filters': [item.text() for item in self.filter_list.selectedItems()],
-            'zoom_p': self.zoom_static_spin.value(),
+            'zoom_p': self._subs_preview_zoom_p(),
             'overlay_file': self.overlay_path.text().strip() or None,
             'overlay_pos': self.overlay_pos_combo.currentText(),
+            'overlay_scale_p': self.overlay_scale_slider.value(),
             'output_format': self.output_format_combo.currentText(),
             'blur_background': self.blur_background_checkbox.isChecked(),
             'crop_filter': crop_filter
@@ -997,20 +1374,34 @@ class ProcessingWidgetContent(QWidget):
     def on_preview_finished(self, image_path):
         if os.path.exists(image_path):
             pixmap = QPixmap(image_path)
-            self.preview_label.setPixmap(
-                pixmap.scaled(
-                    self.preview_label.size(),
-                    Qt.KeepAspectRatio,
-                    Qt.SmoothTransformation
+            if pixmap.isNull():
+                self.preview_label.setText('Ошибка: файл предпросмотра повреждён')
+                self._preview_frame_pixmap = None
+                self._preview_signature_pending = None
+            else:
+                self.preview_label.setPixmap(
+                    pixmap.scaled(
+                        self.preview_label.size(),
+                        Qt.KeepAspectRatio,
+                        Qt.SmoothTransformation
+                    )
                 )
-            )
+                if self._preview_signature_pending is not None:
+                    self._preview_signature = self._preview_signature_pending
+                self._preview_signature_pending = None
+                self._preview_frame_pixmap = pixmap
         else:
             self.preview_label.setText('Ошибка: файл предпросмотра не найден')
+            self._preview_signature_pending = None
         
+        self.update_subtitle_on_video_preview()
         self.set_controls_enabled(True)
     
     def on_preview_error(self, error_msg):
         self.preview_label.setText('Ошибка генерации предпросмотра')
+        self._preview_frame_pixmap = None
+        self._preview_signature_pending = None
+        self.update_subtitle_on_video_preview()
         QMessageBox.critical(self, 'Ошибка предпросмотра', f'Не удалось создать предпросмотр:\n\n{error_msg}')
         self.set_controls_enabled(True)
     
@@ -1025,6 +1416,7 @@ class ProcessingWidgetContent(QWidget):
         self.blur_background_checkbox.setEnabled(is_reels)
         if not is_reels:
             self.blur_background_checkbox.setChecked(False)
+        self.update_subtitle_on_video_preview()
     
     def on_list_menu(self, pos: QPoint):
         menu = QMenu()
@@ -1092,17 +1484,20 @@ class ProcessingWidgetContent(QWidget):
             self.refresh_video_list_display()
     
     def refresh_video_list_display(self):
+        self._subs_frame_dim_cache = None
         for i in range(self.video_list_widget.count()):
             it = self.video_list_widget.item(i)
             if not it.text().startswith('[YT]'):
                 f = it.data(Qt.UserRole)
                 base_name = os.path.basename(f)
                 it.setText(f'{i + 1}. {base_name}')
+        self.update_subtitle_on_video_preview()
     
     def on_zoom_mode_changed(self):
         is_dynamic = self.zoom_dynamic_radio.isChecked()
         self.zoom_static_widget.setVisible(not is_dynamic)
         self.zoom_dynamic_widget.setVisible(is_dynamic)
+        self.update_subtitle_on_video_preview()
     
     def on_speed_mode_changed(self):
         is_dynamic = self.speed_dynamic_radio.isChecked()
@@ -1154,6 +1549,7 @@ class ProcessingWidgetContent(QWidget):
             'viral_count': self.viral_count_spin.value(),
             'overlay_file': self.overlay_path.text().strip(),
             'overlay_pos': self.overlay_pos_combo.currentText(),
+            'overlay_scale': self.overlay_scale_slider.value(),
             'subtitle_mode': subs_mode,
             'subtitle_srt_path': self.subs_srt_path.text().strip(),
             'subtitle_model': self.subs_model_combo.currentText(),
@@ -1164,6 +1560,9 @@ class ProcessingWidgetContent(QWidget):
             'subtitle_font_size': self.subs_size_spin.value(),
             'subtitle_outline': self.subs_outline_spin.value(),
             'subtitle_outline_mode': self.subs_outline_mode_combo.currentText(),
+            'subtitle_alignment': int(self.subs_position_combo.currentData() or 2),
+            'subtitle_margin_v': self.subs_margin_v_spin.value(),
+            'subtitle_margin_lr': self.subs_margin_lr_spin.value(),
             'subtitle_text_color': self.subs_text_color_hex,
             'subtitle_outline_color': self.subs_outline_color_hex,
             'subtitle_bold': font_flags['bold'],
@@ -1222,6 +1621,7 @@ class ProcessingWidgetContent(QWidget):
         overlay_pos = preset.get('overlay_pos', self.overlay_pos_combo.currentText())
         if self.overlay_pos_combo.findText(overlay_pos) >= 0:
             self.overlay_pos_combo.setCurrentText(overlay_pos)
+        self.overlay_scale_slider.setValue(int(preset.get('overlay_scale', 100)))
 
         subs_mode = preset.get('subtitle_mode', 'none')
         self.subs_off_radio.setChecked(subs_mode == 'none')
@@ -1236,7 +1636,7 @@ class ProcessingWidgetContent(QWidget):
         lang = preset.get('subtitle_language', self.subs_lang_combo.currentText())
         if self.subs_lang_combo.findText(lang) >= 0:
             self.subs_lang_combo.setCurrentText(lang)
-        self.subs_words_spin.setValue(int(preset.get('subtitle_words_per_line', 4)))
+        self.subs_words_spin.setValue(int(preset.get('subtitle_words_per_line', 2)))
 
         font_name = preset.get('subtitle_font', self.subs_font_combo.currentText())
         if self.subs_font_combo.findText(font_name) >= 0:
@@ -1251,6 +1651,21 @@ class ProcessingWidgetContent(QWidget):
         outline_mode = preset.get('subtitle_outline_mode', self.subs_outline_mode_combo.currentText())
         if self.subs_outline_mode_combo.findText(outline_mode) >= 0:
             self.subs_outline_mode_combo.setCurrentText(outline_mode)
+
+        al = int(preset.get('subtitle_alignment', 2))
+        _idx = -1
+        for i in range(self.subs_position_combo.count()):
+            raw = self.subs_position_combo.itemData(i)
+            try:
+                if int(raw) == al:
+                    _idx = i
+                    break
+            except (TypeError, ValueError):
+                continue
+        if _idx >= 0:
+            self.subs_position_combo.setCurrentIndex(_idx)
+        self.subs_margin_v_spin.setValue(int(preset.get('subtitle_margin_v', 110)))
+        self.subs_margin_lr_spin.setValue(int(preset.get('subtitle_margin_lr', 28)))
 
         self.subs_text_color_hex = preset.get('subtitle_text_color', '#FFFFFF')
         self.subs_outline_color_hex = preset.get('subtitle_outline_color', '#000000')
@@ -1339,6 +1754,11 @@ class ProcessingWidgetContent(QWidget):
             subtitle_settings['language'] = self.subs_lang_combo.currentText()
             subtitle_settings['words_per_line'] = self.subs_words_spin.value()
         
+        _al_raw = self.subs_position_combo.currentData()
+        try:
+            _alignment = int(_al_raw) if _al_raw is not None else 2
+        except (TypeError, ValueError):
+            _alignment = 2
         subtitle_settings['style'] = {
             'font_size': self.subs_size_spin.value(),
             'font_name': self.subs_font_combo.currentText().strip() or 'Arial',
@@ -1349,6 +1769,9 @@ class ProcessingWidgetContent(QWidget):
             'outline_color': self.subs_outline_color_hex,
             'outline': self.subs_outline_spin.value(),
             'outline_mode': self.subs_outline_mode_combo.currentText().lower(),
+            'alignment': _alignment,
+            'margin_v': self.subs_margin_v_spin.value(),
+            'margin_lr': self.subs_margin_lr_spin.value(),
         }
         
         # Создание worker'а
@@ -1365,6 +1788,7 @@ class ProcessingWidgetContent(QWidget):
             speed_max=self.speed_max_spin.value(),
             overlay_file=self.overlay_path.text().strip() or None,
             overlay_pos=self.overlay_pos_combo.currentText(),
+            overlay_scale_p=self.overlay_scale_slider.value(),
             out_dir=out_dir,
             mute_audio=self.mute_checkbox.isChecked(),
             output_format=self.output_format_combo.currentText(),

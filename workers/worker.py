@@ -1,4 +1,6 @@
 from PyQt5.QtCore import QThread, pyqtSignal
+from datetime import datetime
+import logging
 import os
 import random
 import subprocess
@@ -7,7 +9,15 @@ import tempfile
 import shutil
 from typing import List, Optional, Dict
 
-from utils.ffmpeg_utils import process_single, detect_crop_dimensions, detect_viral_moments, burn_subtitles_postprocess
+from utils.constants import REELS_FORMAT_NAME
+from utils.ffmpeg_utils import (
+    process_single,
+    detect_crop_dimensions,
+    detect_viral_moments,
+    burn_subtitles_postprocess,
+    get_video_dimensions,
+    reels_letterbox_vertical_inset_px,
+)
 from utils.subtitle_utils import extract_audio, generate_srt_from_whisper, build_segment_srt
 
 
@@ -34,6 +44,7 @@ class Worker(QThread):
         speed_max: int,
         overlay_file: Optional[str],
         overlay_pos: str,
+        overlay_scale_p: int,
         out_dir: str,
         mute_audio: bool,
         output_format: str,
@@ -64,6 +75,7 @@ class Worker(QThread):
         self.speed_max = speed_max
         self.overlay_file = overlay_file
         self.overlay_pos = overlay_pos
+        self.overlay_scale_p = overlay_scale_p
         self.out_dir = out_dir
         self.mute_audio = mute_audio
         self.output_format = output_format
@@ -131,18 +143,17 @@ class Worker(QThread):
                 print('Worker stopped.')
                 break
             
-            # Подготовка имен файлов
+            # Подготовка имён: дата-время + случайный хвост, чтобы выходы не затирали друг друга
             base_name = os.path.basename(in_file_path)
             name_part, _ = os.path.splitext(base_name)
             
-            # Определение суффикса в зависимости от формата
             suffix = '_reels' if self.output_format != 'Оригинальный' else '_processed'
-            out_file_name = f'{name_part}{suffix}.mp4'
+            file_unique = f"{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}_{uuid.uuid4().hex[:8]}"
+            out_file_name = f'{name_part}{suffix}_{file_unique}.mp4'
             out_file_path = os.path.join(self.out_dir, out_file_name)
             
-            # Проверка на совпадение входного и выходного пути
             if os.path.abspath(in_file_path) == os.path.abspath(out_file_path):
-                alt_out_file_name = f'{name_part}{suffix}_output.mp4'
+                alt_out_file_name = f'{name_part}{suffix}_output_{file_unique}.mp4'
                 out_file_path = os.path.join(self.out_dir, alt_out_file_name)
                 print(f'Warning: Output path is same as input. Saving to: {alt_out_file_name}')
             
@@ -197,7 +208,7 @@ class Worker(QThread):
                         if seg_suffix:
                             current_out_file_path = os.path.join(
                                 self.out_dir,
-                                f'{name_part}{suffix}{seg_suffix}.mp4'
+                                f'{name_part}{suffix}{seg_suffix}_{file_unique}.mp4'
                             )
 
                         # Этап 1: обрабатываем/режем БЕЗ субтитров.
@@ -209,6 +220,7 @@ class Worker(QThread):
                             speed_p=current_speed,
                             overlay_file=self.overlay_file,
                             overlay_pos=self.overlay_pos,
+                            overlay_scale_p=self.overlay_scale_p,
                             output_format=self.output_format,
                             blur_background=self.blur_background,
                             mute_audio=self.mute_audio,
@@ -256,6 +268,15 @@ class Worker(QThread):
                                 )
                                 segment_srt_paths.append(seg_srt_path)
 
+                        subtitle_style_for_burn = dict(self.subtitle_settings.get('style') or {})
+                        if self.output_format == REELS_FORMAT_NAME:
+                            sw, sh = get_video_dimensions(in_file_path)
+                            lb_inset = reels_letterbox_vertical_inset_px(
+                                sw, sh, crop_filter, current_zoom
+                            )
+                            if lb_inset > 0:
+                                subtitle_style_for_burn['reels_letterbox_inset'] = lb_inset
+
                         if effective_srt_path and os.path.exists(effective_srt_path) and os.path.getsize(effective_srt_path) > 0:
                             try:
                                 tmp_sub_out = os.path.join(self.out_dir, f'{uuid.uuid4()}_subpass.mp4')
@@ -263,7 +284,7 @@ class Worker(QThread):
                                     in_path=current_out_file_path,
                                     out_path=tmp_sub_out,
                                     srt_path=effective_srt_path,
-                                    subtitle_style=self.subtitle_settings.get('style', {}),
+                                    subtitle_style=subtitle_style_for_burn,
                                     codec=self.codec,
                                     plain_subtitles=False
                                 )
@@ -271,7 +292,7 @@ class Worker(QThread):
                                     os.remove(current_out_file_path)
                                     os.replace(tmp_sub_out, current_out_file_path)
                             except Exception as post_err:
-                                print(f'Postprocess subtitle burn failed (styled): {post_err}')
+                                logging.exception('Postprocess subtitle burn failed (styled)')
                                 try:
                                     # fallback: простой режим без force_style
                                     tmp_sub_out_plain = os.path.join(self.out_dir, f'{uuid.uuid4()}_subpass_plain.mp4')
@@ -279,7 +300,7 @@ class Worker(QThread):
                                         in_path=current_out_file_path,
                                         out_path=tmp_sub_out_plain,
                                         srt_path=effective_srt_path,
-                                        subtitle_style=self.subtitle_settings.get('style', {}),
+                                        subtitle_style=subtitle_style_for_burn,
                                         codec=self.codec,
                                         plain_subtitles=True
                                     )
@@ -296,7 +317,7 @@ class Worker(QThread):
                                         self.status_update.emit('Вшивание сабов не удалось, сохранен .srt рядом с видео.')
                                     except Exception:
                                         pass
-                                    print(f'Postprocess subtitle burn failed (plain): {plain_err}')
+                                    logging.exception('Postprocess subtitle burn failed (plain)')
                         elif subtitle_mode != 'none':
                             self.status_update.emit('Субтитры пустые/некорректные, вшивание пропущено.')
                         self.output_paths.append(current_out_file_path)

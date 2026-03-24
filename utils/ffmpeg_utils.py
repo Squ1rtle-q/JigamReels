@@ -5,8 +5,10 @@ FFmpeg utilities module for video processing.
 
 import os
 import subprocess
+import tempfile
 import random
 import platform
+import math
 import shlex
 import shutil
 import re
@@ -161,14 +163,16 @@ def run_ffmpeg(cmd: List[str], input_file_for_log: str = "input",
         return_code = process.wait()
         
         if return_code != 0:
+            tail = '\n'.join(output_lines[-25:])
             error_message = (
                 f'FFmpeg failed with exit code {return_code} for file \'{os.path.basename(input_file_for_log)}\'.\n'
                 f'Command: {command_for_log}\n'
-                f'Last lines of output:\n' + '\n'.join(output_lines[-15:])
+                f'Last lines of output:\n{tail}'
             )
+            logging.error(error_message)
             raise subprocess.CalledProcessError(
-                return_code, 
-                final_cmd, 
+                return_code,
+                final_cmd,
                 output='\n'.join(output_lines),
                 stderr='\n'.join(output_lines)
             )
@@ -380,7 +384,8 @@ def detect_viral_moments(path: str, clip_duration: int = 15, max_clips: int = 3)
     """
     Находит самые динамичные/виральные участки по комбинации:
     - плотности смен сцен (scene score)
-    - средней громкости звука (RMS level)
+    - громкости аудио (RMS) и её **изменчивости** (речь/сцены «пульсируют» сильнее, чем ровная музыка в опенинге)
+    - штраф за пересечение с типичными зонами **опенинга/титров** в начале и **аутро** в конце
 
     Args:
         path: Путь к входному видео
@@ -412,24 +417,41 @@ def detect_viral_moments(path: str, clip_duration: int = 15, max_clips: int = 3)
     scene_points = _collect_scene_change_timestamps(path)
     audio_levels = _collect_audio_rms_levels(path)
 
-    # Зоны, которые обычно содержат интро/аутро, слегка штрафуем.
-    edge_guard = min(12.0, max(4.0, duration * 0.08))
+    # Типичные опенинги/заставки (быстрая нарезка + музыка без диалога) — первая минута-две и хвост серии.
+    opening_guard = min(180.0, max(55.0, duration * 0.035))
+    ending_guard = min(150.0, max(45.0, duration * 0.042))
 
     scored = []
     for start in candidates:
         end = min(start + clip_duration, duration)
+        seg_len = end - start
+        if seg_len <= 1e-6:
+            continue
+
         scene_score = _scene_density_score(scene_points, start, end)
-        audio_score = _audio_energy_score(audio_levels, start, end)
+        audio_energy = _audio_energy_score(audio_levels, start, end)
+        audio_dynamics = _audio_dynamics_score(audio_levels, start, end)
         motion_presence = _motion_presence_bonus(scene_points, start, end)
 
-        edge_penalty = 0.0
-        if start < edge_guard:
-            edge_penalty += 0.22
-        if end > (duration - edge_guard):
-            edge_penalty += 0.22
+        # Доля окна в «опенинге» / «аутро» (0..1) — мягкий штраф пропорционально перекрытию.
+        opening_overlap = max(0.0, min(end, opening_guard) - max(0.0, start))
+        opening_overlap = min(opening_overlap, seg_len)
+        opening_r = opening_overlap / seg_len
 
-        # Приоритет динамики сцены + наличие движения.
-        score = (scene_score * 0.72) + (audio_score * 0.18) + (motion_presence * 0.10) - edge_penalty
+        tail = max(0.0, duration - ending_guard)
+        ending_overlap = max(0.0, min(end, duration) - max(start, tail))
+        ending_overlap = min(ending_overlap, seg_len)
+        ending_r = ending_overlap / seg_len
+
+        edge_penalty = 0.58 * opening_r + 0.52 * ending_r
+
+        # В зоне опенинга много склеек под музыку даёт высокий scene_score — снижаем его вклад.
+        scene_eff = scene_score * (1.0 - 0.72 * opening_r)
+        scene_eff = max(scene_eff, scene_score * 0.12)
+
+        audio_combined = 0.40 * audio_energy + 0.60 * audio_dynamics
+
+        score = (scene_eff * 0.66) + (audio_combined * 0.20) + (motion_presence * 0.12) - edge_penalty
         scored.append((score, start, end - start))
 
     scored.sort(key=lambda x: x[0], reverse=True)
@@ -570,6 +592,24 @@ def _audio_energy_score(audio_points: List[Tuple[float, float]], start: float, e
     return max(0.0, min(1.0, normalized))
 
 
+def _audio_dynamics_score(audio_points: List[Tuple[float, float]], start: float, end: float) -> float:
+    """
+    Оценка «пульсации» RMS в окне (дБ по отсчётам astats).
+    Ровная музыкальная подложка в титрах часто даёт низкий разброс; речь и активные сцены — выше.
+    """
+    if end <= start or not audio_points:
+        return 0.0
+    levels = [level for t, level in audio_points if start <= t < end]
+    n = len(levels)
+    if n < 4:
+        return 0.35
+    mean = sum(levels) / n
+    var = sum((x - mean) ** 2 for x in levels) / n
+    stdev = math.sqrt(max(0.0, var))
+    # Подобрано по dB-шкале RMS_level: ~1–2 — «ровно», 4–7+ — динамичнее
+    return max(0.0, min(1.0, (stdev - 0.9) / 5.0))
+
+
 def _overlaps_with_selected(
     start: float,
     duration: float,
@@ -586,20 +626,44 @@ def _overlaps_with_selected(
 
 def _hex_to_ass_color(value: str, default_ass: str) -> str:
     """
-    Конвертирует #RRGGBB в ASS-формат &HBBGGRR.
+    Конвертирует #RRGGBB в ASS PrimaryColour/OutlineColour: &HAABBGGRR (00 = непрозрачный).
     """
+    def _norm_ass_default(d: str) -> str:
+        if not d:
+            return '&H00FFFFFF'
+        s = d.replace('&H', '').replace('&h', '')
+        if len(s) == 6:
+            return f'&H00{s}'
+        if len(s) == 8:
+            return f'&H{s}'
+        return '&H00FFFFFF'
+
     if not value:
-        return default_ass
+        return _norm_ass_default(default_ass)
     normalized = value.strip().lstrip('#')
     if len(normalized) != 6:
-        return default_ass
+        return _norm_ass_default(default_ass)
     try:
         r = normalized[0:2]
         g = normalized[2:4]
         b = normalized[4:6]
-        return f'&H{b}{g}{r}'
+        return f'&H00{b}{g}{r}'
     except Exception:
-        return default_ass
+        return _norm_ass_default(default_ass)
+
+
+def _ass_font_size_for_video(font_size_ui: int, video_height: int) -> int:
+    """
+    Размер из UI в ASS FontSize. Без масштаба малое число (напр. 13) на 1920 даёт
+    едва заметные субтитры — libass при PlayRes ≈ высоте кадра трактует FontSize в пикселях.
+    """
+    h = int(video_height) if video_height and video_height > 0 else int(REELS_HEIGHT)
+    try:
+        ui = int(font_size_ui)
+    except (TypeError, ValueError):
+        ui = 36
+    scaled = int(round(float(ui) * float(h) / 1080.0))
+    return max(14, min(scaled, 220))
 
 
 def _escape_path_for_subtitles_filter(path: str) -> str:
@@ -616,12 +680,45 @@ def _escape_path_for_subtitles_filter(path: str) -> str:
     return p
 
 
-def _build_subtitles_vf(srt_path: str, force_style: Optional[str] = None) -> str:
-    """Собирает аргумент -vf subtitles=... (без filename= на Windows)."""
+def _windows_subtitles_fontsdir() -> Optional[str]:
+    """Путь к Fonts для опции subtitles=fontsdir (Windows, libass)."""
+    if platform.system() != 'Windows':
+        return None
+    windir = os.environ.get('WINDIR', r'C:\Windows')
+    fonts = os.path.join(windir, 'Fonts')
+    if not os.path.isdir(fonts):
+        return None
+    p = os.path.normpath(fonts).replace('\\', '/')
+    return p.replace(':', '\\:')
+
+
+def _build_subtitles_vf(
+    srt_path: str,
+    force_style: Optional[str] = None,
+    video_w: int = 0,
+    video_h: int = 0,
+) -> str:
+    """
+    Собирает единый фильтр subtitles=... (без filename= на Windows).
+    Для SRT: original_size и charenc помогают libass.
+    Для .ass: не задаём charenc UTF-8 и original_size — иначе часть сборок libav/libass
+    ломает стиль/цвета из файла и показывает дефолт (белый текст, другие поля).
+    """
     inner = _escape_path_for_subtitles_filter(srt_path)
-    if not force_style:
-        return f"subtitles='{inner}'"
-    return f"subtitles='{inner}':force_style='{force_style}'"
+    parts = [f"subtitles='{inner}'"]
+    is_ass = str(srt_path).lower().endswith('.ass')
+    if force_style:
+        fs = _force_style_argument_for_subtitles_filter(force_style)
+        parts.append(f"force_style='{fs}'")
+    if not is_ass:
+        if video_w > 0 and video_h > 0:
+            parts.append(f'original_size={int(video_w)}x{int(video_h)}')
+        parts.append('charenc=UTF-8')
+    fd = _windows_subtitles_fontsdir()
+    if fd:
+        # Без кавычек FFmpeg на Windows режет значение по ':' после диска (C: → ошибка парсера).
+        parts.append(f"fontsdir='{fd}'")
+    return ':'.join(parts)
 
 
 def _escape_force_style_value(value: str) -> str:
@@ -636,6 +733,256 @@ def _escape_force_style_value(value: str) -> str:
     return v
 
 
+def _force_style_argument_for_subtitles_filter(force_style: str) -> str:
+    """
+    Готовит всю строку force_style к передаче в subtitles=...:force_style='...'.
+    Символ & в &HAABBGGRR иначе трактуется парсером фильтров FFmpeg и отрезает хвост
+    опций — libass остаётся с дефолтным белым текстом и без части стиля.
+    """
+    return str(force_style).replace('&', r'\&')
+
+
+def _parse_crop_wh_from_filter(crop_filter: Optional[str]) -> Optional[Tuple[int, int]]:
+    """Из строки вида crop=w:h:x:y извлекает w,h (числа)."""
+    if not crop_filter:
+        return None
+    m = re.search(r'crop=(\d+):(\d+):\d+:\d+', crop_filter.replace(' ', ''))
+    if not m:
+        return None
+    try:
+        return int(m.group(1)), int(m.group(2))
+    except ValueError:
+        return None
+
+
+def reels_letterbox_vertical_inset_px(
+    src_w: int,
+    src_h: int,
+    crop_filter: Optional[str],
+    zoom_p: int,
+) -> int:
+    """
+    Высота нижней «лишней» зоны (размытие/чёрное) между низом чёткого видео и
+    низом кадра Reels 9:16 после scale=decrease + overlay/pad и зума с
+    центральным crop (как в process_single для is_reels_format).
+
+    Нужна, чтобы Alignment «внизу» не опирался на низ всего 1920px.
+    """
+    target_w, target_h = float(REELS_WIDTH), float(REELS_HEIGHT)
+    h_out = target_h
+    if src_w <= 0 or src_h <= 0:
+        return 0
+    parsed = _parse_crop_wh_from_filter(crop_filter)
+    if parsed:
+        eff_w, eff_h = float(parsed[0]), float(parsed[1])
+    else:
+        eff_w, eff_h = float(src_w), float(src_h)
+    if eff_w <= 0 or eff_h <= 0:
+        return 0
+    scale = min(target_w / eff_w, target_h / eff_h)
+    fg_h = eff_h * scale  # высота вписанного видео до зума (как [fg] / pad)
+    z = max(zoom_p / 100.0, 0.01)
+    # Высота видимой нижней полосы в пикселях выхода (см. центральный crop после scale=z).
+    bottom_extra = (h_out / 2.0) * max(0.0, 1.0 - (z * fg_h / h_out))
+    return int(max(0, round(bottom_extra)))
+
+
+def reels_preview_bars_heights(
+    src_w: int,
+    src_h: int,
+    crop_filter: Optional[str],
+    zoom_p: int,
+) -> Tuple[float, float, int]:
+    """
+    Для превью в UI: высота вписанного видео fg_h, высота верхней/нижней полосы bar
+    (до зума, симметрично), и нижняя компенсация субтитров (как reels_letterbox_vertical_inset_px).
+    """
+    target_w, target_h = float(REELS_WIDTH), float(REELS_HEIGHT)
+    if src_w <= 0 or src_h <= 0:
+        return target_h, 0.0, 0
+    parsed = _parse_crop_wh_from_filter(crop_filter)
+    if parsed:
+        eff_w, eff_h = float(parsed[0]), float(parsed[1])
+    else:
+        eff_w, eff_h = float(src_w), float(src_h)
+    if eff_w <= 0 or eff_h <= 0:
+        return target_h, 0.0, 0
+    scale = min(target_w / eff_w, target_h / eff_h)
+    fg_h = eff_h * scale
+    bar = (target_h - fg_h) / 2.0
+    inset = reels_letterbox_vertical_inset_px(src_w, src_h, crop_filter, zoom_p)
+    return fg_h, bar, inset
+
+
+def _subtitle_layout_from_style(subtitle_style: Optional[Dict]) -> Tuple[int, int, int, int]:
+    """
+    ASS Alignment (1..9), MarginL, MarginR, MarginV из словаря настроек субтитров.
+    """
+    st = subtitle_style or {}
+    try:
+        alignment = int(st.get('alignment', 2))
+    except (TypeError, ValueError):
+        alignment = 2
+    if alignment < 1 or alignment > 9:
+        alignment = 2
+    try:
+        margin_lr = max(0, int(st.get('margin_lr', 25)))
+    except (TypeError, ValueError):
+        margin_lr = 25
+    try:
+        margin_v = int(st.get('margin_v', 105))
+    except (TypeError, ValueError):
+        margin_v = 105
+    try:
+        letterbox_inset = max(0, int(st.get('reels_letterbox_inset', 0)))
+    except (TypeError, ValueError):
+        letterbox_inset = 0
+    if letterbox_inset > 0:
+        if alignment in (1, 2, 3, 7, 8, 9):
+            margin_v += letterbox_inset
+    return alignment, margin_lr, margin_lr, margin_v
+
+
+def _subtitle_effective_outline(subtitle_style: Optional[Dict]) -> int:
+    st = subtitle_style or {}
+    try:
+        outline_size = int(st.get('outline', 2))
+    except (TypeError, ValueError):
+        outline_size = 2
+    outline_mode = (st.get('outline_mode', 'снаружи') or 'снаружи').lower()
+    if outline_mode == 'снаружи' and outline_size > 0:
+        return max(1, outline_size + 1)
+    return outline_size
+
+
+def _srt_timestamp_to_seconds(ts: str) -> float:
+    """HH:MM:SS,mmm → секунды."""
+    ts = ts.strip()
+    hh_mm_ss, ms_part = ts.split(',')
+    hh, mm, ss = hh_mm_ss.split(':')
+    ms = int(ms_part.ljust(3, '0')[:3])
+    return int(hh) * 3600 + int(mm) * 60 + int(ss) + ms / 1000.0
+
+
+def _seconds_to_ass_timestamp(sec: float) -> str:
+    """Секунды → H:MM:SS.cc (сантисекунды), как в ASS."""
+    sec = max(0.0, float(sec))
+    cs_total = int(round(sec * 100.0))
+    h = cs_total // 360000
+    cs_total %= 360000
+    m = cs_total // 6000
+    cs_total %= 6000
+    s = cs_total // 100
+    cc = cs_total % 100
+    return f'{h:d}:{m:02d}:{s:02d}.{cc:02d}'
+
+
+def _escape_ass_dialogue_text(text: str) -> str:
+    """Экранирование текста в поле Dialogue (ASS)."""
+    t = text.replace('\\', '\\\\').replace('{', '\\{').replace('}', '\\}')
+    t = t.replace('\r\n', '\n').replace('\r', '\n')
+    t = t.replace('\n', '\\N')
+    t = t.replace(',', '\uFF0C')  # запятая как разделитель поля ASS
+    return t
+
+
+def write_styled_ass_from_srt(
+    srt_path: str,
+    ass_path: str,
+    subtitle_style: Optional[Dict],
+    playres_w: int,
+    playres_h: int,
+) -> None:
+    """
+    Полный ASS со стилем (обходит глючный на Windows парсинг subtitles:force_style=).
+    """
+    with open(srt_path, 'r', encoding='utf-8-sig') as f:
+        raw = f.read().strip()
+    if not raw:
+        raise ValueError(f'Empty SRT: {srt_path}')
+
+    st = dict(subtitle_style) if subtitle_style else {}
+    font_name = (st.get('font_name') or 'Arial').replace('\n', ' ').replace('\r', ' ')
+    font_name = font_name.replace(',', ' ').strip() or 'Arial'
+    try:
+        fs_ui = int(st.get('font_size', 36))
+    except (TypeError, ValueError):
+        fs_ui = 36
+    font_size = _ass_font_size_for_video(fs_ui, playres_h)
+
+    bold = -1 if st.get('font_bold') else 0
+    italic = -1 if st.get('font_italic') else 0
+    underline = -1 if st.get('font_underline') else 0
+
+    primary = _hex_to_ass_color(st.get('text_color', '#FFFFFF'), '&H00FFFFFF')
+    outline_c = _hex_to_ass_color(st.get('outline_color', '#000000'), '&H00000000')
+    secondary = '&H00000000'
+    back = '&H00000000'
+
+    align, ml, mr, mv = _subtitle_layout_from_style(st)
+    outline = int(_subtitle_effective_outline(st))
+
+    fn_field = font_name.replace('"', '')
+    if ',' in fn_field:
+        fn_field = f'"{fn_field}"'
+
+    events_lines: List[str] = []
+    for block in raw.split('\n\n'):
+        block = block.strip()
+        if not block:
+            continue
+        lines = [ln.replace('\r', '') for ln in block.split('\n')]
+        if len(lines) < 2:
+            continue
+        timing_line = lines[1].strip()
+        if '-->' not in timing_line:
+            continue
+        left, right = timing_line.split('-->', 1)
+        try:
+            t0 = _srt_timestamp_to_seconds(left.strip())
+            t1 = _srt_timestamp_to_seconds(right.strip())
+        except (ValueError, IndexError):
+            continue
+        body = '\n'.join(lines[2:]).strip()
+        if not body:
+            continue
+        etext = _escape_ass_dialogue_text(body)
+        events_lines.append(
+            f'Dialogue: 0,{_seconds_to_ass_timestamp(t0)},{_seconds_to_ass_timestamp(t1)},'
+            f'Default,,0,0,0,,{etext}\n'
+        )
+
+    if not events_lines:
+        raise ValueError(f'No subtitle cues parsed from SRT: {srt_path}')
+
+    pw = max(1, int(playres_w))
+    ph = max(1, int(playres_h))
+
+    header = (
+        '[Script Info]\n'
+        'Title: ReelsMakerPro\n'
+        'ScriptType: v4.00+\n'
+        'WrapStyle: 0\n'
+        'ScaledBorderAndShadow: yes\n'
+        f'PlayResX: {pw}\n'
+        f'PlayResY: {ph}\n'
+        '\n'
+        '[V4+ Styles]\n'
+        'Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, '
+        'BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, '
+        'BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n'
+        f'Style: Default,{fn_field},{font_size},{primary},{secondary},{outline_c},{back},'
+        f'{bold},{italic},{underline},0,100,100,0,0,1,{outline},0,{align},{ml},{mr},{mv},1\n'
+        '\n'
+        '[Events]\n'
+        'Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n'
+    )
+
+    with open(ass_path, 'w', encoding='utf-8-sig') as out:
+        out.write(header)
+        out.writelines(events_lines)
+
+
 def process_single(
     in_path: str,
     out_path: str,
@@ -644,6 +991,7 @@ def process_single(
     speed_p: int,
     overlay_file: Optional[str] = None,
     overlay_pos: str = "center",
+    overlay_scale_p: int = 100,
     output_format: str = "mp4",
     blur_background: bool = False,
     mute_audio: bool = False,
@@ -690,7 +1038,8 @@ def process_single(
     
     cmd = []
     input_streams = []
-    
+    subtitle_ass_cleanup: List[str] = []
+
     # Настройка входного потока
     if is_gif_input:
         cmd.extend(['-stream_loop', '-1', '-i', in_path])
@@ -824,6 +1173,11 @@ def process_single(
             filter_complex_parts.append(f'{last_video_node}scale=iw*{zoom_factor}:ih*{zoom_factor}:flags=bicubic{scale_node}')
             last_video_node = scale_node
     
+    # Размер кадра для libass (SRT без PlayRes)
+    _sub_vw, _sub_vh = (REELS_WIDTH, REELS_HEIGHT) if is_reels_format else get_video_dimensions(in_path)
+    if _sub_vw <= 0 or _sub_vh <= 0:
+        _sub_vw, _sub_vh = REELS_WIDTH, REELS_HEIGHT
+
     # Добавление субтитров
     if srt_path:
         if os.path.exists(srt_path):
@@ -831,50 +1185,27 @@ def process_single(
                 new_node_label = f'[v{node_idx}]'
                 node_idx += 1
                 filter_complex_parts.append(
-                    f"{last_video_node}{_build_subtitles_vf(srt_path)}{new_node_label}"
+                    f"{last_video_node}{_build_subtitles_vf(srt_path, video_w=_sub_vw, video_h=_sub_vh)}{new_node_label}"
                 )
                 last_video_node = new_node_label
             else:
-                subtitle_style = subtitle_style or {}
-                font_size = subtitle_style.get('font_size', 36)
-                font_name = _escape_force_style_value(subtitle_style.get('font_name', 'Arial'))
-                font_bold = -1 if subtitle_style.get('font_bold', False) else 0
-                font_italic = -1 if subtitle_style.get('font_italic', False) else 0
-                font_underline = -1 if subtitle_style.get('font_underline', False) else 0
-                text_color_ass = _hex_to_ass_color(subtitle_style.get('text_color', '#FFFFFF'), '&HFFFFFF')
-                outline_color_ass = _hex_to_ass_color(subtitle_style.get('outline_color', '#000000'), '&H000000')
-                outline_size = subtitle_style.get('outline', 2)
-                outline_mode = (subtitle_style.get('outline_mode', 'снаружи') or 'снаружи').lower()
-                position_code = 2
-                vertical_margin = 70
-
-                base_style_params = [
-                    f'Alignment={position_code}',
-                    'MarginL=25',
-                    'MarginR=25',
-                    f'MarginV={vertical_margin}',
-                    f'FontName={font_name}',
-                    f'FontSize={font_size}',
-                    f'Bold={font_bold}',
-                    f'Italic={font_italic}',
-                    f'Underline={font_underline}',
-                    'BorderStyle=1',
-                    'Shadow=1'
-                ]
-
-                effective_outline = outline_size
-                if outline_mode == 'снаружи' and outline_size > 0:
-                    effective_outline = max(1, outline_size + 1)
-
-                style_string = '\\,'.join(base_style_params + [
-                    f'PrimaryColour={text_color_ass}',
-                    f'OutlineColour={outline_color_ass}',
-                    f'Outline={effective_outline}'
-                ])
+                ass_fd, ass_path = tempfile.mkstemp(suffix='.ass', text=True)
+                os.close(ass_fd)
+                try:
+                    write_styled_ass_from_srt(
+                        srt_path, ass_path, subtitle_style or {}, _sub_vw, _sub_vh
+                    )
+                except Exception:
+                    try:
+                        os.remove(ass_path)
+                    except OSError:
+                        pass
+                    raise
+                subtitle_ass_cleanup.append(ass_path)
                 new_node_label = f'[v{node_idx}]'
                 node_idx += 1
                 filter_complex_parts.append(
-                    f"{last_video_node}{_build_subtitles_vf(srt_path, force_style=style_string)}{new_node_label}"
+                    f"{last_video_node}{_build_subtitles_vf(ass_path, video_w=_sub_vw, video_h=_sub_vh)}{new_node_label}"
                 )
                 last_video_node = new_node_label
         else:
@@ -940,13 +1271,25 @@ def process_single(
     if overlay_stream_label:
         pos_params = OVERLAY_POSITIONS.get(overlay_pos, 'x=(W-w)/2:y=(H-h)/2')
         
-        alpha_node = f'[ovl{node_idx}]'
+        ovl_fmt = f'[ovl_fmt{node_idx}]'
         node_idx += 1
+        filter_complex_parts.append(f'{overlay_stream_label}format=rgba{ovl_fmt}')
+        ovl_ready = ovl_fmt
+        try:
+            scale_ov = int(overlay_scale_p)
+        except (TypeError, ValueError):
+            scale_ov = 100
+        sf = max(0.05, min(5.0, scale_ov / 100.0))
+        if abs(sf - 1.0) > 1e-4:
+            ovl_sc = f'[ovl_sc{node_idx}]'
+            node_idx += 1
+            filter_complex_parts.append(
+                f'{ovl_fmt}scale=iw*{sf}:ih*{sf}:flags=bicubic{ovl_sc}'
+            )
+            ovl_ready = ovl_sc
         overlay_node = f'[v{node_idx}]'
         node_idx += 1
-        
-        filter_complex_parts.append(f'{overlay_stream_label}format=rgba{alpha_node}')
-        filter_complex_parts.append(f'{last_video_node}{alpha_node}overlay={pos_params}{overlay_node}')
+        filter_complex_parts.append(f'{last_video_node}{ovl_ready}overlay={pos_params}{overlay_node}')
         last_video_node = overlay_node
     
     # Финальное форматирование
@@ -993,7 +1336,20 @@ def process_single(
     
     # Запуск FFmpeg
     duration = trim_duration if trim_duration and trim_duration > 0 else get_video_duration(in_path)
-    run_ffmpeg(final_cmd, input_file_for_log=in_path, duration=duration, progress_callback=progress_callback)
+    try:
+        run_ffmpeg(
+            final_cmd,
+            input_file_for_log=in_path,
+            duration=duration,
+            progress_callback=progress_callback,
+        )
+    finally:
+        for _ap in subtitle_ass_cleanup:
+            try:
+                if _ap and os.path.isfile(_ap):
+                    os.remove(_ap)
+            except OSError:
+                pass
 
 
 def burn_subtitles_postprocess(
@@ -1011,45 +1367,61 @@ def burn_subtitles_postprocess(
     if not srt_path or not os.path.exists(srt_path):
         raise FileNotFoundError(f'SRT file not found for postprocess: {srt_path}')
 
-    force_style = None
+    vw, vh = get_video_dimensions(in_path)
+    if vw <= 0 or vh <= 0:
+        vw, vh = int(REELS_WIDTH), int(REELS_HEIGHT)
+
+    sub_path_for_filter = srt_path
+    ass_tmp: Optional[str] = None
     if not plain_subtitles:
-        subtitle_style = subtitle_style or {}
-        font_size = subtitle_style.get('font_size', 36)
-        font_name = _escape_force_style_value(subtitle_style.get('font_name', 'Arial'))
-        font_bold = -1 if subtitle_style.get('font_bold', False) else 0
-        font_italic = -1 if subtitle_style.get('font_italic', False) else 0
-        text_color_ass = _hex_to_ass_color(subtitle_style.get('text_color', '#FFFFFF'), '&HFFFFFF')
-        outline_color_ass = _hex_to_ass_color(subtitle_style.get('outline_color', '#000000'), '&H000000')
-        outline_size = subtitle_style.get('outline', 2)
-        # Минимальный набор стилей для совместимости разных сборок ffmpeg/libass.
-        force_style = '\\,'.join([
-            f'FontName={font_name}',
-            f'FontSize={font_size}',
-            f'Bold={font_bold}',
-            f'Italic={font_italic}',
-            f'PrimaryColour={text_color_ass}',
-            f'OutlineColour={outline_color_ass}',
-            'BorderStyle=1',
-            f'Outline={outline_size}'
-        ])
+        ass_fd, ass_path = tempfile.mkstemp(suffix='.ass', text=True)
+        os.close(ass_fd)
+        ass_tmp = ass_path
+        try:
+            write_styled_ass_from_srt(
+                srt_path, ass_path, subtitle_style or {}, vw, vh
+            )
+        except Exception:
+            try:
+                os.remove(ass_path)
+            except OSError:
+                pass
+            raise
+        sub_path_for_filter = ass_path
 
-    vf_filter = _build_subtitles_vf(srt_path, force_style=force_style)
+    try:
+        vf_filter = _build_subtitles_vf(
+            sub_path_for_filter, force_style=None, video_w=vw, video_h=vh
+        )
+        if codec and ('nvenc' in codec or 'amf' in codec or 'qsv' in codec):
+            vf_filter = f'{vf_filter},format=yuv420p'
 
-    cmd = ['-y', '-i', in_path, '-vf', vf_filter, '-c:v', codec]
+        cmd = ['-y', '-i', in_path, '-vf', vf_filter, '-c:v', codec]
 
-    if 'nvenc' in codec or 'amf' in codec:
-        cmd.extend(['-cq', '24'])
-    elif 'qsv' in codec:
-        cmd.extend(['-global_quality', '24'])
-    else:
-        cmd.extend(['-preset', 'veryfast', '-crf', '24'])
+        if 'nvenc' in codec or 'amf' in codec:
+            cmd.extend(['-cq', '24', '-pix_fmt', 'yuv420p'])
+        elif 'qsv' in codec:
+            cmd.extend(['-global_quality', '24', '-pix_fmt', 'yuv420p'])
+        else:
+            cmd.extend(['-preset', 'veryfast', '-crf', '24'])
 
-    cmd.extend(['-c:a', 'copy', out_path])
-    run_ffmpeg(cmd, input_file_for_log=in_path, duration=get_video_duration(in_path), progress_callback=None)
-    logging.info(
-        'Subtitle postprocess OK (%s).',
-        'plain' if plain_subtitles else 'styled',
-    )
+        cmd.extend(['-c:a', 'copy', out_path])
+        run_ffmpeg(
+            cmd,
+            input_file_for_log=in_path,
+            duration=get_video_duration(in_path),
+            progress_callback=None,
+        )
+        logging.info(
+            'Subtitle postprocess OK (%s).',
+            'plain' if plain_subtitles else 'styled',
+        )
+    finally:
+        if ass_tmp and os.path.isfile(ass_tmp):
+            try:
+                os.remove(ass_tmp)
+            except OSError:
+                pass
 
 
 def generate_preview(
@@ -1059,6 +1431,7 @@ def generate_preview(
     zoom_p: int,
     overlay_file: Optional[str] = None,
     overlay_pos: str = "center",
+    overlay_scale_p: int = 100,
     output_format: str = "jpg",
     blur_background: bool = False,
     crop_filter: Optional[str] = None
@@ -1205,13 +1578,25 @@ def generate_preview(
     if overlay_stream_label:
         pos_params = OVERLAY_POSITIONS.get(overlay_pos, 'x=(W-w)/2:y=(H-h)/2')
         
-        alpha_node = f'[ovl{node_idx}]'
+        ovl_fmt = f'[ovl_fmt{node_idx}]'
         node_idx += 1
+        filter_complex_parts.append(f'{overlay_stream_label}format=rgba{ovl_fmt}')
+        ovl_ready = ovl_fmt
+        try:
+            scale_ov = int(overlay_scale_p)
+        except (TypeError, ValueError):
+            scale_ov = 100
+        sf = max(0.05, min(5.0, scale_ov / 100.0))
+        if abs(sf - 1.0) > 1e-4:
+            ovl_sc = f'[ovl_sc{node_idx}]'
+            node_idx += 1
+            filter_complex_parts.append(
+                f'{ovl_fmt}scale=iw*{sf}:ih*{sf}:flags=bicubic{ovl_sc}'
+            )
+            ovl_ready = ovl_sc
         overlay_node = f'[v{node_idx}]'
         node_idx += 1
-        
-        filter_complex_parts.append(f'{overlay_stream_label}format=rgba{alpha_node}')
-        filter_complex_parts.append(f'{last_video_node}{alpha_node}overlay={pos_params}{overlay_node}')
+        filter_complex_parts.append(f'{last_video_node}{ovl_ready}overlay={pos_params}{overlay_node}')
         last_video_node = overlay_node
     
     # Финальное форматирование
