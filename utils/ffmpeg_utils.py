@@ -18,21 +18,51 @@ from typing import List, Optional, Tuple, Dict, Callable
 # Импорт констант (предполагаемые значения)
 try:
     from utils.constants import (
-        FFMPEG_EXE_PATH, 
-        FILTERS, 
-        OVERLAY_POSITIONS, 
-        REELS_WIDTH, 
-        REELS_HEIGHT, 
-        REELS_FORMAT_NAME
+        FFMPEG_EXE_PATH,
+        FILTERS,
+        REELS_WIDTH,
+        REELS_HEIGHT,
+        REELS_FORMAT_NAME,
+        VIDEO_EXTENSIONS,
     )
 except ImportError:
     # Fallback значения если модуль constants недоступен
     FFMPEG_EXE_PATH = "bin/ffmpeg.exe"
     FILTERS = {}
-    OVERLAY_POSITIONS = {}
     REELS_WIDTH = 1080
     REELS_HEIGHT = 1920
     REELS_FORMAT_NAME = f"Reels/TikTok ({REELS_WIDTH}x{REELS_HEIGHT})"
+    VIDEO_EXTENSIONS = ['.mp4', '.avi', '.mov', '.mkv', '.wmv', '.flv', '.webm', '.m4v']
+
+
+def _overlay_input_should_stream_loop(path: Optional[str]) -> bool:
+    """GIF и видео-баннеры зацикливаем под длину основного ролика."""
+    if not path:
+        return False
+    ext = os.path.splitext(path)[1].lower()
+    if ext == '.gif':
+        return True
+    return ext in VIDEO_EXTENSIONS
+
+
+def _hex_to_chromakey_color(value: Optional[str]) -> str:
+    """#RRGGBB → 0xRRGGBB для фильтра chromakey FFmpeg."""
+    s = (value or '').strip().lstrip('#')
+    if len(s) != 6:
+        return '0x00FF00'
+    try:
+        int(s, 16)
+    except ValueError:
+        return '0x00FF00'
+    return f'0x{s.upper()}'
+
+
+def _clamp_chromakey_float(x: float, lo: float, hi: float) -> float:
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        v = lo
+    return max(lo, min(hi, v))
 
 
 from utils.path_utils import get_ffmpeg_path
@@ -814,6 +844,45 @@ def reels_preview_bars_heights(
     return fg_h, bar, inset
 
 
+def build_overlay_position_params(
+    alignment: int,
+    margin_v: int,
+    margin_lr: int,
+) -> str:
+    """
+    Строка x=...:y=... для фильтра overlay (сетка 1..9, как ASS / субтитры в UI).
+    margin_v: для низа — отступ от нижнего края кадра; для верха — от верхнего;
+              для середины по вертикали — сдвиг относительно центра.
+    margin_lr: отступ от левого/правого края.
+    """
+    try:
+        a = int(alignment)
+    except (TypeError, ValueError):
+        a = 5
+    a = max(1, min(9, a))
+    try:
+        mv = int(margin_v)
+    except (TypeError, ValueError):
+        mv = 0
+    try:
+        mlr = max(0, int(margin_lr))
+    except (TypeError, ValueError):
+        mlr = 0
+    if a in (1, 2, 3):
+        yexpr = f'H-h-{mv}'
+    elif a in (7, 8, 9):
+        yexpr = f'{mv}'
+    else:
+        yexpr = f'(H-h)/2+{mv}'
+    if a in (1, 4, 7):
+        xexpr = f'{mlr}'
+    elif a in (2, 5, 8):
+        xexpr = '(W-w)/2'
+    else:
+        xexpr = f'W-w-{mlr}'
+    return f'x={xexpr}:y={yexpr}'
+
+
 def _subtitle_layout_from_style(subtitle_style: Optional[Dict]) -> Tuple[int, int, int, int]:
     """
     ASS Alignment (1..9), MarginL, MarginR, MarginV из словаря настроек субтитров.
@@ -990,7 +1059,9 @@ def process_single(
     zoom_p: int,
     speed_p: int,
     overlay_file: Optional[str] = None,
-    overlay_pos: str = "center",
+    overlay_alignment: int = 5,
+    overlay_margin_v: int = 0,
+    overlay_margin_lr: int = 0,
     overlay_scale_p: int = 100,
     output_format: str = "mp4",
     blur_background: bool = False,
@@ -1006,7 +1077,11 @@ def process_single(
     progress_callback: Optional[Callable[[int], None]] = None,
     trim_start: Optional[float] = None,
     trim_duration: Optional[float] = None,
-    plain_subtitles: bool = False
+    plain_subtitles: bool = False,
+    overlay_chromakey: bool = False,
+    overlay_chromakey_color: str = '#00FF00',
+    overlay_chromakey_similarity: float = 0.15,
+    overlay_chromakey_blend: float = 0.08,
 ) -> None:
     """
     Обработка одного видеофайла с применением различных эффектов.
@@ -1018,7 +1093,9 @@ def process_single(
         zoom_p: Процент увеличения (100 = без изменений)
         speed_p: Процент скорости (100 = нормальная скорость)
         overlay_file: Путь к файлу оверлея
-        overlay_pos: Позиция оверлея
+        overlay_alignment: Сетка 1..9 (как у субтитров)
+        overlay_margin_v: Отступ сверху/снизу (пиксели)
+        overlay_margin_lr: Отступ слева/справа
         output_format: Формат выходного файла
         blur_background: Размытие фона для формата reels
         mute_audio: Отключение звука
@@ -1034,7 +1111,7 @@ def process_single(
     """
     # Определение типов входных файлов
     is_gif_input = in_path.lower().endswith('.gif')
-    is_gif_overlay = overlay_file and overlay_file.lower().endswith('.gif')
+    overlay_loop = bool(overlay_file and _overlay_input_should_stream_loop(overlay_file))
     
     cmd = []
     input_streams = []
@@ -1063,7 +1140,7 @@ def process_single(
     if overlay_file and os.path.exists(overlay_file):
         overlay_input_index = len(input_streams)
         
-        if is_gif_overlay:
+        if overlay_loop:
             cmd.extend(['-stream_loop', '-1', '-i', overlay_file])
         else:
             cmd.extend(['-i', overlay_file])
@@ -1071,7 +1148,7 @@ def process_single(
         input_streams.append({'type': 'overlay', 'index': overlay_input_index, 'path': overlay_file})
         overlay_stream_label = f'[{overlay_input_index}:v]'
     else:
-        is_gif_overlay = False
+        overlay_loop = False
     
     # Добавление аудио оверлея
     overlay_audio_stream_label = None
@@ -1267,13 +1344,43 @@ def process_single(
         filter_complex_parts.append(f'{last_video_node}setpts=PTS/{speed_factor}{new_node_label}')
         last_video_node = new_node_label
     
-    # Добавление видео оверлея
+    # Добавление видео оверлея (картинка / GIF / видео MP4-MOV с опц. chromakey)
     if overlay_stream_label:
-        pos_params = OVERLAY_POSITIONS.get(overlay_pos, 'x=(W-w)/2:y=(H-h)/2')
-        
+        try:
+            o_al = int(overlay_alignment)
+        except (TypeError, ValueError):
+            o_al = 5
+        try:
+            o_mv = int(overlay_margin_v)
+        except (TypeError, ValueError):
+            o_mv = 0
+        try:
+            o_mlr = int(overlay_margin_lr)
+        except (TypeError, ValueError):
+            o_mlr = 0
+        mv_eff = o_mv
+        if is_reels_format and o_al in (1, 2, 3, 7, 8, 9):
+            _sw, _sh = get_video_dimensions(in_path)
+            if _sw <= 0 or _sh <= 0:
+                _sw, _sh = REELS_WIDTH, REELS_HEIGHT
+            _lb = reels_letterbox_vertical_inset_px(_sw, _sh, crop_filter, zoom_p)
+            if _lb > 0:
+                mv_eff = o_mv + _lb
+        pos_params = build_overlay_position_params(o_al, mv_eff, o_mlr)
+        ovl_cur = overlay_stream_label
+        if overlay_chromakey:
+            ck = _hex_to_chromakey_color(overlay_chromakey_color)
+            sim = _clamp_chromakey_float(overlay_chromakey_similarity, 0.01, 0.8)
+            bl = _clamp_chromakey_float(overlay_chromakey_blend, 0.0, 0.5)
+            ovl_ck = f'[ovl_ck{node_idx}]'
+            node_idx += 1
+            filter_complex_parts.append(
+                f'{ovl_cur}chromakey={ck}:{sim}:{bl}{ovl_ck}'
+            )
+            ovl_cur = ovl_ck
         ovl_fmt = f'[ovl_fmt{node_idx}]'
         node_idx += 1
-        filter_complex_parts.append(f'{overlay_stream_label}format=rgba{ovl_fmt}')
+        filter_complex_parts.append(f'{ovl_cur}format=rgba{ovl_fmt}')
         ovl_ready = ovl_fmt
         try:
             scale_ov = int(overlay_scale_p)
@@ -1289,7 +1396,9 @@ def process_single(
             ovl_ready = ovl_sc
         overlay_node = f'[v{node_idx}]'
         node_idx += 1
-        filter_complex_parts.append(f'{last_video_node}{ovl_ready}overlay={pos_params}{overlay_node}')
+        filter_complex_parts.append(
+            f'{last_video_node}{ovl_ready}overlay={pos_params}:shortest=1{overlay_node}'
+        )
         last_video_node = overlay_node
     
     # Финальное форматирование
@@ -1424,81 +1533,45 @@ def burn_subtitles_postprocess(
                 pass
 
 
-def generate_preview(
+def _build_preview_filter_complex(
     in_path: str,
-    out_path: str,
     filters: List[str],
     zoom_p: int,
-    overlay_file: Optional[str] = None,
-    overlay_pos: str = "center",
-    overlay_scale_p: int = 100,
-    output_format: str = "jpg",
-    blur_background: bool = False,
-    crop_filter: Optional[str] = None
-) -> None:
+    overlay_file: Optional[str],
+    overlay_alignment: int,
+    overlay_margin_v: int,
+    overlay_margin_lr: int,
+    overlay_scale_p: int,
+    output_format: str,
+    blur_background: bool,
+    crop_filter: Optional[str],
+    overlay_chromakey: bool,
+    overlay_chromakey_color: str,
+    overlay_chromakey_similarity: float,
+    overlay_chromakey_blend: float,
+    video_pixel_format: str,
+) -> str:
     """
-    Генерация превью (одного кадра) из видео с применением эффектов.
-    
-    Args:
-        in_path: Путь к входному видеофайлу
-        out_path: Путь к выходному файлу изображения
-        filters: Список названий фильтров для применения
-        zoom_p: Процент увеличения (100 = без изменений)
-        overlay_file: Путь к файлу оверлея
-        overlay_pos: Позиция оверлея
-        output_format: Формат выходного файла
-        blur_background: Размытие фона для формата reels
-        crop_filter: Фильтр обрезки
+    Общий filter_complex для still/clip превью. video_pixel_format: 'rgba' | 'yuv420p'.
     """
-    is_gif_input = in_path.lower().endswith('.gif')
-    
-    # Определение времени для кадра
-    duration = get_video_duration(in_path)
-    if duration > 0 and not is_gif_input:
-        mid_point = duration / 2  # Берем кадр из середины видео
-    else:
-        mid_point = 0
-    
-    cmd = ['-y']
-    
-    # Добавление времени начала для обычных видео
-    if not is_gif_input:
-        cmd.extend(['-ss', str(mid_point)])
-    
-    # Входные файлы
-    input_files = ['-i', in_path]
-    
-    if overlay_file and os.path.exists(overlay_file):
-        input_files.extend(['-i', overlay_file])
-    
-    cmd.extend(input_files)
-    
-    # Построение filter_complex
-    filter_complex_parts = []
+    filter_complex_parts: List[str] = []
     main_video_stream_label = '[0:v]'
-    
-    overlay_stream_label = None
-    if overlay_file and os.path.exists(overlay_file):
-        overlay_stream_label = '[1:v]'
-    
+    overlay_stream_label = '[1:v]' if overlay_file and os.path.exists(overlay_file) else None
+
     last_video_node = main_video_stream_label
     node_idx = 0
-    
-    # Применение фильтра обрезки
+
     if crop_filter:
         new_node_label = f'[v{node_idx}]'
         filter_complex_parts.append(f'{last_video_node}{crop_filter}{new_node_label}')
         last_video_node = new_node_label
         node_idx += 1
-    
-    # Настройка целевых размеров
+
     target_w, target_h = REELS_WIDTH, REELS_HEIGHT
     is_reels_format = output_format == REELS_FORMAT_NAME
 
-    # Форматирование для reels
     if is_reels_format:
         if blur_background:
-            # С размытым фоном
             filter_complex_parts.append(
                 f'{last_video_node}split[original][original_copy];'
                 f'[original_copy]scale={target_w}:{target_h}:force_original_aspect_ratio=increase,'
@@ -1508,79 +1581,98 @@ def generate_preview(
                 f'[bg][fg]overlay=x=(W-w)/2:y=(H-h)/2[formatted]'
             )
         else:
-            # С черными полосами
             filter_complex_parts.append(
                 f'{last_video_node}scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,'
                 f'pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2:color=black[formatted]'
             )
         last_video_node = '[formatted]'
-    
-    # Проверка наличия случайного фильтра в списке
+
     is_random_filter_in_list = 'Случайный фильтр' in filters
-    
-    # Применение фильтров
+
     for f_name in filters:
         f_template = FILTERS.get(f_name)
         if not f_template or f_name == 'Нет фильтра':
             continue
-        
-        # Пропускаем обычные фильтры если есть случайный
         if is_random_filter_in_list and f_name != 'Случайный фильтр':
             continue
-        
         final_template = ''
-        
         if f_name == 'Случайный фильтр':
-            # Для превью используем фиксированный фильтр "Сепия"
             final_template = FILTERS.get('Сепия', '')
         elif f_name == 'Случ. цвет (яркость/контраст/...)':
-            # Фиксированные параметры для превью
-            br = 0.1
-            ct = 1.1
-            sat = 1.1
-            hue = 2
+            br, ct, sat, hue = 0.1, 1.1, 1.1, 2
             final_template = f_template.format(br=br, ct=ct, sat=sat, hue=hue)
         else:
             final_template = f_template
-        
         if final_template:
             new_node_label = f'[v{node_idx}]'
             filter_complex_parts.append(f'{last_video_node}{final_template}{new_node_label}')
             last_video_node = new_node_label
             node_idx += 1
-    
-    # Применение зума
+
     zoom_factor = zoom_p / 100
     if abs(zoom_factor - 1) > 1e-5:
         if zoom_factor >= 1:
-            # Увеличение с последующей обрезкой
             scale_node = f'[v{node_idx}]'
             node_idx += 1
-            filter_complex_parts.append(f'{last_video_node}scale=iw*{zoom_factor}:ih*{zoom_factor}:flags=bicubic{scale_node}')
-            
+            filter_complex_parts.append(
+                f'{last_video_node}scale=iw*{zoom_factor}:ih*{zoom_factor}:flags=bicubic{scale_node}'
+            )
             crop_node = f'[v{node_idx}]'
             node_idx += 1
-            
             if is_reels_format:
-                filter_complex_parts.append(f'{scale_node}crop={target_w}:{target_h}:(in_w-{target_w})/2:(in_h-{target_h})/2{crop_node}')
+                filter_complex_parts.append(
+                    f'{scale_node}crop={target_w}:{target_h}:(in_w-{target_w})/2:(in_h-{target_h})/2{crop_node}'
+                )
             else:
-                filter_complex_parts.append(f'{scale_node}crop=iw/{zoom_factor}:ih/{zoom_factor}:(in_w-iw/{zoom_factor})/2:(in_h-ih/{zoom_factor})/2{crop_node}')
-            
+                filter_complex_parts.append(
+                    f'{scale_node}crop=iw/{zoom_factor}:ih/{zoom_factor}:'
+                    f'(in_w-iw/{zoom_factor})/2:(in_h-ih/{zoom_factor})/2{crop_node}'
+                )
             last_video_node = crop_node
         else:
-            # Уменьшение
             scale_node = f'[v{node_idx}]'
             node_idx += 1
-            filter_complex_parts.append(f'{last_video_node}scale=iw*{zoom_factor}:ih*{zoom_factor}:flags=bicubic{scale_node}')
+            filter_complex_parts.append(
+                f'{last_video_node}scale=iw*{zoom_factor}:ih*{zoom_factor}:flags=bicubic{scale_node}'
+            )
             last_video_node = scale_node
-    
-    # Добавление видео оверлея
+
     if overlay_stream_label:
-        pos_params = OVERLAY_POSITIONS.get(overlay_pos, 'x=(W-w)/2:y=(H-h)/2')
-        
+        try:
+            _oa = int(overlay_alignment)
+        except (TypeError, ValueError):
+            _oa = 5
+        try:
+            _omv = int(overlay_margin_v)
+        except (TypeError, ValueError):
+            _omv = 0
+        try:
+            _omlr = int(overlay_margin_lr)
+        except (TypeError, ValueError):
+            _omlr = 0
+        _mv_eff = _omv
+        if is_reels_format and _oa in (1, 2, 3, 7, 8, 9):
+            _psw, _psh = get_video_dimensions(in_path)
+            if _psw <= 0 or _psh <= 0:
+                _psw, _psh = REELS_WIDTH, REELS_HEIGHT
+            _plb = reels_letterbox_vertical_inset_px(_psw, _psh, crop_filter, zoom_p)
+            if _plb > 0:
+                _mv_eff = _omv + _plb
+        pos_params = build_overlay_position_params(_oa, _mv_eff, _omlr)
+        ovl_cur = overlay_stream_label
+        if overlay_chromakey:
+            ck = _hex_to_chromakey_color(overlay_chromakey_color)
+            sim = _clamp_chromakey_float(overlay_chromakey_similarity, 0.01, 0.8)
+            bl = _clamp_chromakey_float(overlay_chromakey_blend, 0.0, 0.5)
+            ovl_ck = f'[pr_ovl_ck{node_idx}]'
+            node_idx += 1
+            filter_complex_parts.append(
+                f'{ovl_cur}chromakey={ck}:{sim}:{bl}{ovl_ck}'
+            )
+            ovl_cur = ovl_ck
         ovl_fmt = f'[ovl_fmt{node_idx}]'
         node_idx += 1
-        filter_complex_parts.append(f'{overlay_stream_label}format=rgba{ovl_fmt}')
+        filter_complex_parts.append(f'{ovl_cur}format=rgba{ovl_fmt}')
         ovl_ready = ovl_fmt
         try:
             scale_ov = int(overlay_scale_p)
@@ -1596,22 +1688,169 @@ def generate_preview(
             ovl_ready = ovl_sc
         overlay_node = f'[v{node_idx}]'
         node_idx += 1
-        filter_complex_parts.append(f'{last_video_node}{ovl_ready}overlay={pos_params}{overlay_node}')
+        filter_complex_parts.append(
+            f'{last_video_node}{ovl_ready}overlay={pos_params}:shortest=1{overlay_node}'
+        )
         last_video_node = overlay_node
+
+    vfmt = 'rgba' if video_pixel_format == 'rgba' else 'yuv420p'
+    filter_complex_parts.append(f'{last_video_node}format={vfmt}[vout]')
+    return ';'.join(filter(None, filter_complex_parts))
+
+
+def generate_preview(
+    in_path: str,
+    out_path: str,
+    filters: List[str],
+    zoom_p: int,
+    overlay_file: Optional[str] = None,
+    overlay_alignment: int = 5,
+    overlay_margin_v: int = 0,
+    overlay_margin_lr: int = 0,
+    overlay_scale_p: int = 100,
+    output_format: str = "jpg",
+    blur_background: bool = False,
+    crop_filter: Optional[str] = None,
+    overlay_chromakey: bool = False,
+    overlay_chromakey_color: str = '#00FF00',
+    overlay_chromakey_similarity: float = 0.15,
+    overlay_chromakey_blend: float = 0.08,
+) -> None:
+    """
+    Генерация превью (одного кадра) из видео с применением эффектов.
     
-    # Финальное форматирование
-    filter_complex_parts.append(f'{last_video_node}format=rgba[vout]')
-    
-    # Сборка filter_complex
-    fc_string = ';'.join(filter(None, filter_complex_parts))
-    
-    if fc_string:
-        cmd.extend(['-filter_complex', fc_string])
-        cmd.extend(['-map', '[vout]'])
-    
-    # Генерация одного кадра
-    cmd.extend(['-vframes', '1'])
+    Args:
+        in_path: Путь к входному видеофайлу
+        out_path: Путь к выходному файлу изображения
+        filters: Список названий фильтров для применения
+        zoom_p: Процент увеличения (100 = без изменений)
+        overlay_file: Путь к файлу оверлея
+        overlay_alignment: Сетка 1..9
+        overlay_margin_v: Отступ сверху/снизу
+        overlay_margin_lr: Отступ слева/справа
+        output_format: Формат выходного файла
+        blur_background: Размытие фона для формата reels
+        crop_filter: Фильтр обрезки
+    """
+    is_gif_input = in_path.lower().endswith('.gif')
+
+    duration = get_video_duration(in_path)
+    if duration > 0 and not is_gif_input:
+        mid_point = duration / 2
+    else:
+        mid_point = 0
+
+    cmd = ['-y']
+    if not is_gif_input:
+        cmd.extend(['-ss', str(mid_point)])
+
+    input_files = ['-i', in_path]
+    if overlay_file and os.path.exists(overlay_file):
+        if _overlay_input_should_stream_loop(overlay_file):
+            input_files.extend(['-stream_loop', '-1', '-i', overlay_file])
+        else:
+            input_files.extend(['-i', overlay_file])
+    cmd.extend(input_files)
+
+    fc_string = _build_preview_filter_complex(
+        in_path,
+        filters,
+        zoom_p,
+        overlay_file,
+        overlay_alignment,
+        overlay_margin_v,
+        overlay_margin_lr,
+        overlay_scale_p,
+        output_format,
+        blur_background,
+        crop_filter,
+        overlay_chromakey,
+        overlay_chromakey_color,
+        overlay_chromakey_similarity,
+        overlay_chromakey_blend,
+        'rgba',
+    )
+    cmd.extend(['-filter_complex', fc_string])
+    cmd.extend(['-map', '[vout]'])
+
+    cmd.extend(['-frames:v', '1', '-update', '1'])
     cmd.append(out_path)
-    
-    # Запуск FFmpeg
+
+    run_ffmpeg(cmd, input_file_for_log=in_path)
+
+
+def generate_preview_clip(
+    in_path: str,
+    out_path: str,
+    filters: List[str],
+    zoom_p: int,
+    overlay_file: Optional[str] = None,
+    overlay_alignment: int = 5,
+    overlay_margin_v: int = 0,
+    overlay_margin_lr: int = 0,
+    overlay_scale_p: int = 100,
+    output_format: str = "jpg",
+    blur_background: bool = False,
+    crop_filter: Optional[str] = None,
+    overlay_chromakey: bool = False,
+    overlay_chromakey_color: str = '#00FF00',
+    overlay_chromakey_similarity: float = 0.15,
+    overlay_chromakey_blend: float = 0.08,
+    max_seconds: float = 8.0,
+) -> None:
+    """
+    Короткий превью-клип с начала ролика (для анимированного баннера). Без аудио, H.264.
+    """
+    is_gif_input = in_path.lower().endswith('.gif')
+    duration = get_video_duration(in_path)
+    try:
+        cap = float(max_seconds)
+    except (TypeError, ValueError):
+        cap = 8.0
+    cap = max(0.5, min(30.0, cap))
+    if duration > 0:
+        clip_len = min(cap, duration)
+    else:
+        clip_len = cap
+
+    cmd = ['-y']
+    # С начала файла (без seek в середину)
+    input_files = ['-i', in_path]
+    if overlay_file and os.path.exists(overlay_file):
+        if _overlay_input_should_stream_loop(overlay_file):
+            input_files.extend(['-stream_loop', '-1', '-i', overlay_file])
+        else:
+            input_files.extend(['-i', overlay_file])
+    cmd.extend(input_files)
+
+    fc_string = _build_preview_filter_complex(
+        in_path,
+        filters,
+        zoom_p,
+        overlay_file,
+        overlay_alignment,
+        overlay_margin_v,
+        overlay_margin_lr,
+        overlay_scale_p,
+        output_format,
+        blur_background,
+        crop_filter,
+        overlay_chromakey,
+        overlay_chromakey_color,
+        overlay_chromakey_similarity,
+        overlay_chromakey_blend,
+        'yuv420p',
+    )
+    cmd.extend(['-filter_complex', fc_string])
+    cmd.extend(['-map', '[vout]'])
+    cmd.extend([
+        '-t', f'{clip_len:.3f}',
+        '-an',
+        '-c:v', 'libx264',
+        '-preset', 'veryfast',
+        '-crf', '23',
+        '-pix_fmt', 'yuv420p',
+    ])
+    cmd.append(out_path)
+
     run_ffmpeg(cmd, input_file_for_log=in_path)

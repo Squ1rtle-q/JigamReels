@@ -8,7 +8,17 @@ import logging
 import copy
 from typing import Optional, Tuple
 
-from PyQt5.QtCore import Qt, QPoint, pyqtSignal, QThread
+from PyQt5.QtCore import Qt, QPoint, QPointF, QRectF, QUrl, pyqtSignal, QThread, QTimer
+
+try:
+    from PyQt5.QtMultimedia import QMediaPlayer, QMediaContent
+    from PyQt5.QtMultimediaWidgets import QVideoWidget
+    PREVIEW_CLIP_AVAILABLE = True
+except ImportError:
+    QMediaPlayer = None  # type: ignore
+    QMediaContent = None  # type: ignore
+    QVideoWidget = None  # type: ignore
+    PREVIEW_CLIP_AVAILABLE = False
 from PyQt5.QtGui import (
     QFontMetrics, QIcon, QPixmap, QFont, QFontDatabase,
     QColor, QPainter, QPainterPath, QPen
@@ -27,11 +37,12 @@ from uploader_core.config_manager import ConfigManager
 from workers.worker import Worker
 from utils.file_utils import is_video_file, find_videos_in_folder
 from utils.constants import (
-    FILTERS, OVERLAY_POSITIONS, REELS_FORMAT_NAME, OUTPUT_FORMATS,
+    FILTERS, OVERLAY_LEGACY_POS_TO_ALIGNMENT, REELS_FORMAT_NAME, OUTPUT_FORMATS,
     CODECS, WHISPER_MODELS, WHISPER_LANGUAGES, APP_NAME, APP_VERSION
 )
 from utils.ffmpeg_utils import (
     generate_preview,
+    generate_preview_clip,
     get_video_duration,
     detect_crop_dimensions,
     get_video_dimensions,
@@ -39,42 +50,12 @@ from utils.ffmpeg_utils import (
     _ass_font_size_for_video,
     _subtitle_effective_outline,
 )
-from utils.youtube_utils import download_video
 from uploader_ui.uploader_widget import UploaderWidget
 from utils.path_utils import resource_path
 
 
-class YoutubeDownloader(QThread):
-    finished_signal = pyqtSignal(str, str)
-    error_signal = pyqtSignal(str)
-    
-    def __init__(self, url, temp_dir, crop_bars):
-        super().__init__()
-        self.url = url
-        self.temp_dir = temp_dir
-        self.crop_bars = crop_bars
-        self.temp_file_path = ''
-        self.cropped_file_path = ''
-    
-    def run(self):
-        try:
-            temp_filename = f'yt_{uuid.uuid4()}.mp4'
-            self.temp_file_path = os.path.join(self.temp_dir, temp_filename)
-            
-            download_video(self.url, self.temp_file_path)
-            
-            if not os.path.exists(self.temp_file_path):
-                raise IOError(f'Файл не был создан после скачивания: {self.temp_file_path}')
-            
-            final_path = self.temp_file_path
-            self.finished_signal.emit(final_path, self.url)
-            
-        except Exception as e:
-            self.error_signal.emit(str(e))
-
-
 class PreviewWorker(QThread):
-    finished_signal = pyqtSignal(str)
+    finished_signal = pyqtSignal(str, str)
     error_signal = pyqtSignal(str)
     
     def __init__(self, params):
@@ -83,8 +64,22 @@ class PreviewWorker(QThread):
     
     def run(self):
         try:
-            generate_preview(**self.params)
-            self.finished_signal.emit(self.params['out_path'])
+            p = self.params
+            common = {
+                k: v for k, v in p.items()
+                if k not in ('out_path_png', 'out_path_clip', 'clip_seconds', 'enable_video_clip')
+            }
+            generate_preview(out_path=p['out_path_png'], **common)
+            clip_dest = p.get('out_path_clip') or ''
+            clip_written = ''
+            if clip_dest and p.get('enable_video_clip', True):
+                generate_preview_clip(
+                    out_path=clip_dest,
+                    max_seconds=float(p.get('clip_seconds', 8.0)),
+                    **common,
+                )
+                clip_written = clip_dest
+            self.finished_signal.emit(p['out_path_png'], clip_written)
         except Exception as e:
             self.error_signal.emit(str(e))
 
@@ -146,19 +141,157 @@ class DropListWidget(QListWidget):
         return False
 
 
+class ZoomPanPreview(QWidget):
+    """
+    Кадр предпросмотра: без начального увеличения (вписан в область), масштаб только Ctrl + колёсико,
+    сдвиг левой кнопкой мыши при увеличении или если кадр больше окна.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._pixmap = QPixmap()
+        self._zoom = 1.0
+        self._pan = QPointF(0.0, 0.0)
+        self._drag_origin = None
+        self._pan_at_drag = QPointF(0.0, 0.0)
+        self._message = "Выберите видео и нажмите 'Обновить'"
+        self.setMinimumHeight(220)
+        self.setStyleSheet('background: #1a1a1e; border: 1px solid #555;')
+        self.setMouseTracking(True)
+        self.setToolTip(
+            'Ctrl + колёсико мыши — масштаб. Зажмите левую кнопку и перетащите — сдвиг кадра.'
+        )
+
+    def set_message(self, text: str):
+        self._message = text
+        self._pixmap = QPixmap()
+        self._zoom = 1.0
+        self._pan = QPointF(0.0, 0.0)
+        self.update()
+
+    def set_image(self, pixmap: QPixmap):
+        self._message = ''
+        if pixmap is not None and not pixmap.isNull():
+            self._pixmap = pixmap.copy()
+        else:
+            self._pixmap = QPixmap()
+        self._zoom = 1.0
+        self._pan = QPointF(0.0, 0.0)
+        self.update()
+
+    def _fit_scale(self) -> float:
+        if self._pixmap.isNull():
+            return 1.0
+        iw, ih = self._pixmap.width(), self._pixmap.height()
+        vw, vh = max(1, self.width()), max(1, self.height())
+        return min(vw / iw, vh / ih)
+
+    def _draw_geometry(self):
+        """Возвращает (x, y, dw, dh) для отрисовки в координатах виджета."""
+        if self._pixmap.isNull():
+            return 0.0, 0.0, 0.0, 0.0
+        fs = self._fit_scale() * self._zoom
+        dw = self._pixmap.width() * fs
+        dh = self._pixmap.height() * fs
+        vw, vh = float(self.width()), float(self.height())
+        x = (vw - dw) / 2.0 + self._pan.x()
+        y = (vh - dh) / 2.0 + self._pan.y()
+        return x, y, dw, dh
+
+    def _clamp_pan(self):
+        if self._pixmap.isNull():
+            return
+        x, y, dw, dh = self._draw_geometry()
+        vw, vh = float(self.width()), float(self.height())
+        fs = self._fit_scale() * self._zoom
+        base_x = (vw - self._pixmap.width() * fs) / 2.0
+        base_y = (vh - self._pixmap.height() * fs) / 2.0
+        nx = x
+        ny = y
+        if dw > vw:
+            nx = max(vw - dw, min(0.0, x))
+        else:
+            nx = base_x
+        if dh > vh:
+            ny = max(vh - dh, min(0.0, y))
+        else:
+            ny = base_y
+        self._pan.setX(self._pan.x() + (nx - x))
+        self._pan.setY(self._pan.y() + (ny - y))
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.fillRect(self.rect(), QColor(26, 26, 30))
+        if self._pixmap.isNull():
+            p.setPen(QColor(180, 180, 185))
+            p.drawText(self.rect(), Qt.AlignCenter | Qt.TextWordWrap, self._message)
+            return
+        x, y, dw, dh = self._draw_geometry()
+        p.setRenderHint(QPainter.SmoothPixmapTransform, True)
+        p.drawPixmap(QRectF(x, y, dw, dh), self._pixmap, QRectF(self._pixmap.rect()))
+
+    def wheelEvent(self, event):
+        if not (event.modifiers() & Qt.ControlModifier):
+            return super().wheelEvent(event)
+        if self._pixmap.isNull():
+            return
+        delta = event.angleDelta().y()
+        if delta == 0:
+            return
+        steps = delta / 120.0
+        factor = 1.1 ** steps
+        self._zoom = max(0.2, min(10.0, self._zoom * factor))
+        self._clamp_pan()
+        self.update()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton and not self._pixmap.isNull():
+            self._drag_origin = event.pos()
+            self._pan_at_drag = QPointF(self._pan)
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if (
+            self._drag_origin is not None
+            and event.buttons() & Qt.LeftButton
+            and not self._pixmap.isNull()
+        ):
+            delta = QPointF(event.pos() - self._drag_origin)
+            self._pan = self._pan_at_drag + delta
+            self._clamp_pan()
+            self.update()
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._drag_origin = None
+        super().mouseReleaseEvent(event)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if not self._pixmap.isNull():
+            self._clamp_pan()
+            self.update()
+
+
 class ProcessingWidgetContent(QWidget):
     video_processed = pyqtSignal(str)
     
     def __init__(self, parent_window):
         super().__init__(parent_window)
         self.parent_window = parent_window
-        self.downloader_thread = None
         self.preview_thread = None
         self.processing_thread = None
         self.last_output_path = None
         self._preview_signature = None
         self._preview_signature_pending = None
         self._preview_frame_pixmap = None
+        self._preview_auto_no_message = False
+        self._clip_last_path = None
+        self._preview_refresh_timer = QTimer(self)
+        self._preview_refresh_timer.setSingleShot(True)
+        self._preview_refresh_timer.setInterval(450)
+        self._preview_refresh_timer.timeout.connect(self._run_deferred_effects_preview)
         self.init_ui()
     
     def init_ui(self):
@@ -170,11 +303,95 @@ class ProcessingWidgetContent(QWidget):
         main_splitter = QSplitter(Qt.Horizontal)
         main_layout.addWidget(main_splitter)
         
-        # Левая панель
+        # Левая панель: вертикальный сплиттер ~75% предпросмотр / ~25% список и кнопки
         left_widget = QWidget()
         self.left_panel = QVBoxLayout(left_widget)
-        self.left_panel.setSpacing(10)
-        
+        self.left_panel.setContentsMargins(0, 0, 0, 0)
+        self.left_panel.setSpacing(0)
+
+        self._left_vert_splitter = QSplitter(Qt.Vertical)
+        self._left_vert_splitter.setChildrenCollapsible(False)
+
+        preview_group = QGroupBox('Предпросмотр')
+        preview_layout = QVBoxLayout(preview_group)
+        self.preview_stack = QStackedWidget()
+        self.preview_video_host = QWidget()
+        pvh_layout = QVBoxLayout(self.preview_video_host)
+        pvh_layout.setContentsMargins(0, 0, 0, 0)
+        if PREVIEW_CLIP_AVAILABLE and QVideoWidget is not None:
+            self.preview_video = QVideoWidget()
+            self.preview_video.setStyleSheet('background: #000000;')
+            self.preview_video.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+            self.preview_video.setMinimumHeight(200)
+            pvh_layout.addWidget(self.preview_video)
+            self._clip_player = QMediaPlayer(None, QMediaPlayer.VideoSurface)
+            self._clip_player.setVideoOutput(self.preview_video)
+            self._clip_player.mediaStatusChanged.connect(self._on_clip_media_status)
+        else:
+            self.preview_video = None
+            self._clip_player = None
+            _no_vid = QLabel('Видео-превью недоступно (PyQt5.QtMultimedia). Статичный кадр — ниже.')
+            _no_vid.setWordWrap(True)
+            _no_vid.setStyleSheet('color: #888;')
+            pvh_layout.addWidget(_no_vid)
+        self.main_preview = ZoomPanPreview(self)
+        self.main_preview.setObjectName('previewLabel')
+        self.preview_stack.addWidget(self.preview_video_host)
+        self.preview_stack.addWidget(self.main_preview)
+        self.preview_stack.setMinimumHeight(220)
+        self.preview_stack.setCurrentIndex(1)
+        preview_layout.addWidget(self.preview_stack)
+        mode_preview_row = QHBoxLayout()
+        self.btn_preview_video_mode = QPushButton('Видео (первые ~8 с)')
+        self.btn_preview_still_mode = QPushButton('Кадр + субтитры')
+        self.btn_preview_video_mode.setCheckable(True)
+        self.btn_preview_still_mode.setCheckable(True)
+        self.btn_preview_still_mode.setChecked(True)
+        self.btn_preview_video_mode.setEnabled(False)
+        self._preview_mode_group = QButtonGroup(self)
+        self._preview_mode_group.setExclusive(True)
+        self._preview_mode_group.addButton(self.btn_preview_video_mode, 0)
+        self._preview_mode_group.addButton(self.btn_preview_still_mode, 1)
+        self.btn_preview_video_mode.clicked.connect(lambda: self._set_preview_stack_visual(0))
+        self.btn_preview_still_mode.clicked.connect(lambda: self._set_preview_stack_visual(1))
+        mode_preview_row.addWidget(self.btn_preview_video_mode)
+        mode_preview_row.addWidget(self.btn_preview_still_mode)
+        mode_preview_row.addStretch()
+        preview_layout.addLayout(mode_preview_row)
+        self.preview_button = QPushButton('Обновить предпросмотр')
+        preview_layout.addWidget(self.preview_button)
+        self._left_vert_splitter.addWidget(preview_group)
+        self._left_vert_splitter.setStretchFactor(0, 3)
+
+        bottom_left = QWidget()
+        bottom_left_layout = QVBoxLayout(bottom_left)
+        bottom_left_layout.setContentsMargins(0, 0, 0, 0)
+        bottom_left_layout.setSpacing(10)
+        top_left_container = QWidget()
+        top_left_layout = QVBoxLayout(top_left_container)
+        top_left_layout.setContentsMargins(0, 0, 0, 0)
+        self.video_list_widget = DropListWidget(parent=self)
+        self.video_list_widget.customContextMenuRequested.connect(self.on_list_menu)
+        top_left_layout.addWidget(self.video_list_widget)
+        dnd_label = QLabel('Перетащите файлы или папки сюда')
+        dnd_label.setAlignment(Qt.AlignCenter)
+        dnd_label.setStyleSheet('color: gray; font-style: italic;')
+        top_left_layout.addWidget(dnd_label)
+        bottom_left_layout.addWidget(top_left_container, 1)
+        add_buttons_layout = QHBoxLayout()
+        btn_add = QPushButton('Добавить видео/GIF')
+        btn_folder = QPushButton('Добавить папку')
+        btn_clear = QPushButton('Очистить список')
+        add_buttons_layout.addWidget(btn_add)
+        add_buttons_layout.addWidget(btn_folder)
+        add_buttons_layout.addWidget(btn_clear)
+        bottom_left_layout.addLayout(add_buttons_layout)
+        self._left_vert_splitter.addWidget(bottom_left)
+        self._left_vert_splitter.setStretchFactor(1, 1)
+        self._left_vert_splitter.setSizes([600, 200])
+
+        self.left_panel.addWidget(self._left_vert_splitter)
+
         # Правая панель
         right_widget = QWidget()
         self.right_panel = QVBoxLayout(right_widget)
@@ -183,56 +400,6 @@ class ProcessingWidgetContent(QWidget):
         main_splitter.addWidget(left_widget)
         main_splitter.addWidget(right_widget)
         main_splitter.setSizes([350, 750])
-        
-        # Кнопки добавления файлов
-        add_buttons_layout = QHBoxLayout()
-        btn_add = QPushButton('Добавить видео/GIF')
-        btn_folder = QPushButton('Добавить папку')
-        btn_clear = QPushButton('Очистить список')
-        
-        add_buttons_layout.addWidget(btn_add)
-        add_buttons_layout.addWidget(btn_folder)
-        add_buttons_layout.addWidget(btn_clear)
-        self.left_panel.addLayout(add_buttons_layout)
-        
-        # Левый сплиттер для видео списка и YouTube блока
-        left_splitter = QSplitter(Qt.Vertical)
-        
-        # Контейнер для списка видео
-        top_left_container = QWidget()
-        top_left_layout = QVBoxLayout(top_left_container)
-        top_left_layout.setContentsMargins(0, 0, 0, 0)
-        
-        # Список видео с drag&drop
-        self.video_list_widget = DropListWidget(parent=self)
-        self.video_list_widget.customContextMenuRequested.connect(self.on_list_menu)
-        top_left_layout.addWidget(self.video_list_widget)
-        
-        # Подсказка для drag&drop
-        dnd_label = QLabel('Перетащите файлы или папки сюда')
-        dnd_label.setAlignment(Qt.AlignCenter)
-        dnd_label.setStyleSheet('color: gray; font-style: italic;')
-        top_left_layout.addWidget(dnd_label)
-        
-        left_splitter.addWidget(top_left_container)
-        
-        # YouTube группа
-        yt_group = QGroupBox('Альтернативный источник')
-        yt_layout = QVBoxLayout(yt_group)
-        yt_layout.addWidget(QLabel('Ссылка на YouTube видео:'))
-        
-        self.yt_url_input = QLineEdit()
-        self.yt_url_input.setPlaceholderText('https://www.youtube.com/watch?v=...')
-        yt_layout.addWidget(self.yt_url_input)
-        
-        self.yt_add_button = QPushButton('Скачать и добавить в список')
-        yt_layout.addWidget(self.yt_add_button)
-        yt_layout.addStretch()
-        
-        left_splitter.addWidget(yt_group)
-        left_splitter.setSizes([400, 150])
-        
-        self.left_panel.addWidget(left_splitter)
         
         # Вкладки настроек
         tab_widget = QTabWidget()
@@ -300,21 +467,6 @@ class ProcessingWidgetContent(QWidget):
         ofg_layout.addWidget(self.codec_combo)
         
         main_tab_layout.addWidget(self.output_format_group)
-        
-        # Группа предпросмотра
-        preview_group = QGroupBox('Предпросмотр')
-        preview_layout = QVBoxLayout(preview_group)
-        
-        self.preview_label = QLabel("Выберите видео и нажмите 'Обновить'")
-        self.preview_label.setObjectName('previewLabel')
-        self.preview_label.setAlignment(Qt.AlignCenter)
-        self.preview_label.setMinimumHeight(220)
-        preview_layout.addWidget(self.preview_label)
-        
-        self.preview_button = QPushButton('Обновить предпросмотр')
-        preview_layout.addWidget(self.preview_button)
-        
-        main_tab_layout.addWidget(preview_group)
         main_tab_layout.addStretch()
         
         # === ВКЛАДКА ТРАНСФОРМАЦИИ ===
@@ -493,7 +645,7 @@ class ProcessingWidgetContent(QWidget):
         # Строка с файлом
         row_ol = QHBoxLayout()
         self.overlay_path = QLineEdit()
-        self.overlay_path.setPlaceholderText('Путь к файлу PNG, JPG, GIF...')
+        self.overlay_path.setPlaceholderText('PNG, JPG, GIF, MP4, MOV, WebM… (видео зацикливается под длину ролика)')
         
         btn_ol = QPushButton('Обзор...')
         btn_clear_ol = QPushButton('X')
@@ -506,23 +658,54 @@ class ProcessingWidgetContent(QWidget):
         row_ol.addWidget(btn_clear_ol)
         ov_lay.addLayout(row_ol)
         
-        # Строка с позицией
         row_pos = QHBoxLayout()
-        row_pos.addWidget(QLabel('Расположение:'))
-        
-        self.overlay_pos_combo = QComboBox()
-        for pos in OVERLAY_POSITIONS:
-            self.overlay_pos_combo.addItem(pos)
-        self.overlay_pos_combo.setCurrentText('Середина-Центр')
-        
-        row_pos.addWidget(self.overlay_pos_combo)
-        row_pos.addStretch()
+        row_pos.addWidget(QLabel('Положение:'))
+        self.overlay_position_combo = QComboBox()
+        _ov_pos_pairs = [
+            ('Внизу слева', 1),
+            ('Внизу по центру', 2),
+            ('Внизу справа', 3),
+            ('По центру слева', 4),
+            ('По центру', 5),
+            ('По центру справа', 6),
+            ('Вверху слева', 7),
+            ('Вверху по центру', 8),
+            ('Вверху справа', 9),
+        ]
+        for _lbl, _aid in _ov_pos_pairs:
+            self.overlay_position_combo.addItem(_lbl, _aid)
+        self.overlay_position_combo.setCurrentIndex(4)
+        self.overlay_position_combo.setToolTip(
+            'Сетка как у субтитров. При выбранном видео предпросмотр обновится при смене.'
+        )
+        row_pos.addWidget(self.overlay_position_combo, 1)
         ov_lay.addLayout(row_pos)
+
+        row_ov_margins = QHBoxLayout()
+        row_ov_margins.addWidget(QLabel('Отступ сверху/снизу:'))
+        self.overlay_margin_v_spin = QSpinBox()
+        self.overlay_margin_v_spin.setRange(-600, 1200)
+        self.overlay_margin_v_spin.setValue(0)
+        self.overlay_margin_v_spin.setToolTip(
+            'Для «Внизу…» — отступ от низа кадра; для «Вверху…» — от верха; для середины — сдвиг от центра.'
+        )
+        row_ov_margins.addWidget(self.overlay_margin_v_spin)
+        row_ov_margins.addSpacing(16)
+        row_ov_margins.addWidget(QLabel('Слева/справа:'))
+        self.overlay_margin_lr_spin = QSpinBox()
+        self.overlay_margin_lr_spin.setRange(0, 350)
+        self.overlay_margin_lr_spin.setValue(0)
+        row_ov_margins.addWidget(self.overlay_margin_lr_spin)
+        row_ov_margins.addStretch()
+        ov_lay.addLayout(row_ov_margins)
 
         row_overlay_scale = QHBoxLayout()
         self.overlay_scale_slider = QSlider(Qt.Horizontal)
         self.overlay_scale_slider.setRange(10, 300)
         self.overlay_scale_slider.setValue(100)
+        self.overlay_scale_slider.setToolTip(
+            'Масштаб баннера на кадре предпросмотра обновляется автоматически (если выбрано видео).'
+        )
         self.overlay_scale_label = QLabel('Масштаб баннера: 100%')
         self.overlay_scale_slider.valueChanged.connect(
             lambda v: self.overlay_scale_label.setText(f'Масштаб баннера: {v}%')
@@ -530,6 +713,34 @@ class ProcessingWidgetContent(QWidget):
         row_overlay_scale.addWidget(self.overlay_scale_label)
         row_overlay_scale.addWidget(self.overlay_scale_slider, 1)
         ov_lay.addLayout(row_overlay_scale)
+
+        self.overlay_chroma_check = QCheckBox('Хромакей (убрать цвет фона, напр. зелёный экран)')
+        self.overlay_chroma_check.setToolTip(
+            'Для видео/картинки с однотонным фоном: выберите цвет ключа и при необходимости подстройте чувствительность.'
+        )
+        ov_lay.addWidget(self.overlay_chroma_check)
+        row_chroma = QHBoxLayout()
+        self.overlay_chroma_color_btn = QPushButton('Цвет ключа')
+        self.overlay_chroma_color_preview = QLabel('   ')
+        self.overlay_chroma_color_preview.setFixedWidth(28)
+        self.overlay_chroma_color_hex = '#00FF00'
+        self.overlay_chroma_color_preview.setStyleSheet('background: #00FF00; border: 1px solid #666;')
+        row_chroma.addWidget(self.overlay_chroma_color_btn)
+        row_chroma.addWidget(self.overlay_chroma_color_preview)
+        row_chroma.addWidget(QLabel('Чувствит.:'))
+        self.overlay_chroma_sim_spin = QSpinBox()
+        self.overlay_chroma_sim_spin.setRange(5, 60)
+        self.overlay_chroma_sim_spin.setValue(15)
+        self.overlay_chroma_sim_spin.setToolTip('Насколько агрессивно вырезать цвет (0.05–0.60). Выше — шире диапазон.')
+        row_chroma.addWidget(self.overlay_chroma_sim_spin)
+        row_chroma.addWidget(QLabel('Край:'))
+        self.overlay_chroma_blend_spin = QSpinBox()
+        self.overlay_chroma_blend_spin.setRange(0, 40)
+        self.overlay_chroma_blend_spin.setValue(8)
+        self.overlay_chroma_blend_spin.setToolTip('Сглаживание края ключа (0–0.40).')
+        row_chroma.addWidget(self.overlay_chroma_blend_spin)
+        row_chroma.addStretch()
+        ov_lay.addLayout(row_chroma)
         
         effects_tab_layout.addWidget(self.overlay_group)
         
@@ -708,13 +919,8 @@ class ProcessingWidgetContent(QWidget):
         preview_layout.addWidget(self.subs_style_preview)
         subs_main_layout.addWidget(preview_group)
 
-        frame_preview_group = QGroupBox('Как на видео (9:16)')
+        frame_preview_group = QGroupBox('Положение субтитров на кадре')
         frame_preview_layout = QVBoxLayout(frame_preview_group)
-        self.subs_on_frame_preview = QLabel()
-        self.subs_on_frame_preview.setAlignment(Qt.AlignCenter)
-        self.subs_on_frame_preview.setMinimumWidth(220)
-        self.subs_on_frame_preview.setStyleSheet('background: #1a1a1e; border: 1px solid #555;')
-        frame_preview_layout.addWidget(self.subs_on_frame_preview)
 
         frame_pos_row1 = QHBoxLayout()
         frame_pos_row1.addWidget(QLabel('Положение:'))
@@ -729,7 +935,10 @@ class ProcessingWidgetContent(QWidget):
         frame_pos_row2.addStretch()
         frame_preview_layout.addLayout(frame_pos_row2)
 
-        self.subs_on_frame_hint = QLabel('')
+        self.subs_on_frame_hint = QLabel(
+            'Итоговый кадр с баннером и субтитрами — в окне «Предпросмотр» слева '
+            '(Ctrl + колёсико — масштаб, перетаскивание — сдвиг).'
+        )
         self.subs_on_frame_hint.setWordWrap(True)
         self.subs_on_frame_hint.setStyleSheet('color: #888; font-size: 11px;')
         frame_preview_layout.addWidget(self.subs_on_frame_hint)
@@ -856,7 +1065,19 @@ class ProcessingWidgetContent(QWidget):
         btn_clear.clicked.connect(self.on_clear_list)
         btn_ol.clicked.connect(self.on_select_overlay)
         btn_clear_ol.clicked.connect(lambda: self.overlay_path.clear())
-        self.yt_add_button.clicked.connect(self.on_add_from_youtube)
+        self.overlay_chroma_color_btn.clicked.connect(self.on_pick_overlay_chroma_color)
+        self.overlay_chroma_check.stateChanged.connect(self.update_subtitle_on_video_preview)
+        self.overlay_chroma_sim_spin.valueChanged.connect(self.update_subtitle_on_video_preview)
+        self.overlay_chroma_blend_spin.valueChanged.connect(self.update_subtitle_on_video_preview)
+        self.overlay_chroma_check.stateChanged.connect(
+            lambda _s: self.schedule_effects_preview_refresh(350)
+        )
+        self.overlay_chroma_sim_spin.valueChanged.connect(
+            lambda _v: self.schedule_effects_preview_refresh(400)
+        )
+        self.overlay_chroma_blend_spin.valueChanged.connect(
+            lambda _v: self.schedule_effects_preview_refresh(400)
+        )
         self.preview_button.clicked.connect(self.on_update_preview)
         btn_browse_srt.clicked.connect(self.on_browse_srt)
         self.subs_mode_group.buttonClicked.connect(self.on_subs_mode_changed)
@@ -884,8 +1105,20 @@ class ProcessingWidgetContent(QWidget):
         self.filter_list.itemSelectionChanged.connect(self.update_subtitle_on_video_preview)
         self.blur_background_checkbox.stateChanged.connect(self.update_subtitle_on_video_preview)
         self.overlay_path.textChanged.connect(self.update_subtitle_on_video_preview)
-        self.overlay_pos_combo.currentTextChanged.connect(self.update_subtitle_on_video_preview)
+        self.overlay_path.textChanged.connect(lambda _t: self.schedule_effects_preview_refresh(600))
+        self.overlay_position_combo.currentIndexChanged.connect(
+            lambda _i: self._on_overlay_geometry_changed(0)
+        )
+        self.overlay_margin_v_spin.valueChanged.connect(
+            lambda _v: self._on_overlay_geometry_changed(250)
+        )
+        self.overlay_margin_lr_spin.valueChanged.connect(
+            lambda _v: self._on_overlay_geometry_changed(250)
+        )
         self.overlay_scale_slider.valueChanged.connect(self.update_subtitle_on_video_preview)
+        self.overlay_scale_slider.valueChanged.connect(
+            lambda _v: self.schedule_effects_preview_refresh(450)
+        )
         
         # Инициализация состояний
         self.on_subs_mode_changed()
@@ -1125,6 +1358,13 @@ class ProcessingWidgetContent(QWidget):
                 return p
         return None
 
+    def _overlay_alignment_value(self) -> int:
+        raw = self.overlay_position_combo.currentData()
+        try:
+            return int(raw) if raw is not None else 5
+        except (TypeError, ValueError):
+            return 5
+
     def _collect_preview_signature(
         self, video_path: Optional[str], crop_filter: Optional[str]
     ) -> Optional[Tuple]:
@@ -1138,22 +1378,29 @@ class ProcessingWidgetContent(QWidget):
             ov = os.path.normcase(os.path.normpath(os.path.abspath(ov_raw)))
         else:
             ov = ''
+        _ch = self._overlay_chroma_params()
         return (
             vp,
             cf,
             filters,
             int(self._subs_preview_zoom_p()),
             ov,
-            self.overlay_pos_combo.currentText(),
+            self._overlay_alignment_value(),
+            int(self.overlay_margin_v_spin.value()),
+            int(self.overlay_margin_lr_spin.value()),
             int(self.overlay_scale_slider.value()),
             self.output_format_combo.currentText(),
             bool(self.blur_background_checkbox.isChecked()),
             bool(self.auto_crop_checkbox.isChecked()),
+            bool(_ch['enabled']),
+            str(_ch['color']),
+            int(self.overlay_chroma_sim_spin.value()),
+            int(self.overlay_chroma_blend_spin.value()),
         )
 
     def update_subtitle_on_video_preview(self):
         """Тот же кадр, что после «Обновить предпросмотр», плюс субтитры в пикселях как при вшивании."""
-        if not hasattr(self, 'subs_on_frame_preview'):
+        if not hasattr(self, 'main_preview'):
             return
 
         W_def, H_def = 1080, 1920
@@ -1263,83 +1510,85 @@ class ProcessingWidgetContent(QWidget):
         )
         painter.end()
 
-        panel_w = max(200, min(360, self.subs_on_frame_preview.width() - 4))
-        if self.subs_on_frame_preview.width() < 100:
-            panel_w = 270
-        s = panel_w / float(W0)
-        disp_w = int(round(W0 * s))
-        disp_h = int(round(H0 * s))
-        final_pix = canvas.scaled(disp_w, disp_h, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-        self.subs_on_frame_preview.setPixmap(final_pix)
-        self.subs_on_frame_preview.setFixedHeight(final_pix.height())
+        self.main_preview.set_image(canvas)
 
         if use_real_frame:
             self.subs_on_frame_hint.setText(
-                'Кадр совпадает с последним «Обновить предпросмотр» (формат, зум, размытие, фильтры, баннер, автообрезка). '
-                'Размер и отступы субтитров — как при вшивании в пикселях кадра.'
+                'Кадр слева совпадает с последним «Обновить предпросмотр» (формат, зум, размытие, фильтры, баннер, автообрезка). '
+                'Размер и отступы субтитров — как при вшивании в пикселях кадра. Ctrl + колёсико — масштаб, перетаскивание — сдвиг.'
             )
         else:
             self.subs_on_frame_hint.setText(
-                'Нажмите «Обновить предпросмотр» на основной вкладке с выбранным видео — здесь будет тот же кадр с эффектами. '
-                'Пока схема полос Reels или условный фон; разметка субтитров (в т.ч. сдвиг при зуме) как при кодировании.'
+                'Нажмите «Обновить предпросмотр» слева с выбранным видео — в окне предпросмотра будет тот же кадр с эффектами и субтитрами. '
+                'Пока схема полос Reels или условный фон; разметка как при кодировании.'
             )
 
     def showEvent(self, event):
         super().showEvent(event)
         self.update_subtitle_style_preview()
 
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        if hasattr(self, 'subs_on_frame_preview') and self.isVisible():
+    def _on_overlay_geometry_changed(self, delay_ms: int = 0):
+        """
+        Баннер рисуется в generate_preview/process_single (FFmpeg). Смена положения/отступов
+        меняет подпись кадра — без пересборки use_real_frame ложен и показывается заглушка.
+        """
+        if self.video_list_widget.selectedItems():
+            self.schedule_effects_preview_refresh(delay_ms)
+        else:
             self.update_subtitle_on_video_preview()
-    
-    def on_add_from_youtube(self):
-        url = self.yt_url_input.text().strip()
-        if not url:
-            QMessageBox.warning(self, 'Нет ссылки', 'Пожалуйста, вставьте ссылку на YouTube видео.')
+
+    def schedule_effects_preview_refresh(self, delay_ms: int = 0):
+        """
+        Пересобрать кадр предпросмотра (баннер: позиция, масштаб, хромакей, файл).
+        delay_ms > 0 — отложить (ползунок масштаба), чтобы не дергать FFmpeg на каждый шаг.
+        """
+        if delay_ms > 0:
+            self._preview_refresh_timer.stop()
+            self._preview_refresh_timer.setInterval(delay_ms)
+            self._preview_refresh_timer.start()
+        else:
+            self._run_deferred_effects_preview()
+
+    def _run_deferred_effects_preview(self):
+        if self.preview_thread is not None and self.preview_thread.isRunning():
             return
-        
-        self.set_controls_enabled(False)
-        self.status_label.setText(f'Скачивание видео: {url[:50]}...')
-        
-        self.downloader_thread = YoutubeDownloader(url, self.parent_window.temp_dir, False)
-        self.downloader_thread.finished_signal.connect(self.on_youtube_download_finished)
-        self.downloader_thread.error_signal.connect(self.on_youtube_download_error)
-        self.downloader_thread.start()
-    
-    def on_youtube_download_finished(self, file_path, original_url):
-        self.status_label.setText('Видео успешно скачано!')
-        self.yt_url_input.clear()
-        self.set_controls_enabled(True)
-        
-        if not self.video_list_widget.is_already_added(file_path):
-            self.parent_window.temp_files.append(file_path)
-            item_text = f'[YT] {os.path.basename(file_path)}'
-            it = QListWidgetItem(item_text)
-            it.setData(Qt.UserRole, file_path)
-            self.video_list_widget.addItem(it)
-            self.refresh_video_list_display()
-    
-    def on_youtube_download_error(self, error_msg):
-        self.status_label.setText('Ошибка скачивания.')
-        QMessageBox.critical(self, 'Ошибка скачивания', f'Не удалось скачать видео:\n\n{error_msg}')
-        self.set_controls_enabled(True)
-    
+        if not self.video_list_widget.selectedItems():
+            return
+        self._preview_auto_no_message = True
+        try:
+            self.on_update_preview()
+        finally:
+            self._preview_auto_no_message = False
+
     def on_update_preview(self):
         selected_items = self.video_list_widget.selectedItems()
         if not selected_items:
-            QMessageBox.warning(self, 'Видео не выбрано', 'Пожалуйста, выберите видео из списка для предпросмотра.')
+            if not self._preview_auto_no_message:
+                QMessageBox.warning(self, 'Видео не выбрано', 'Пожалуйста, выберите видео из списка для предпросмотра.')
             return
         
+        if self._clip_player is not None:
+            self._clip_player.stop()
+        self._clip_last_path = None
+        self.btn_preview_video_mode.setEnabled(False)
+        self.preview_stack.setCurrentIndex(1)
+        self.btn_preview_still_mode.setChecked(True)
+
         in_path = selected_items[0].data(Qt.UserRole)
         temp_preview_path = os.path.join(
             self.parent_window.temp_dir,
             f'preview_{uuid.uuid4()}.png'
         )
+        temp_clip_path = ''
+        if PREVIEW_CLIP_AVAILABLE and self._clip_player is not None:
+            temp_clip_path = os.path.join(
+                self.parent_window.temp_dir,
+                f'preview_clip_{uuid.uuid4()}.mp4'
+            )
         
         crop_filter = None
         if self.auto_crop_checkbox.isChecked():
-            self.preview_label.setText('Анализ кадра для обрезки...')
+            self.main_preview.set_message('Анализ кадра для обрезки...')
             QApplication.processEvents()
             try:
                 crop_filter = detect_crop_dimensions(in_path)
@@ -1349,56 +1598,111 @@ class ProcessingWidgetContent(QWidget):
         
         self._preview_signature_pending = self._collect_preview_signature(in_path, crop_filter)
 
+        _ch = self._overlay_chroma_params()
         params = {
             'in_path': in_path,
-            'out_path': temp_preview_path,
+            'out_path_png': temp_preview_path,
+            'out_path_clip': temp_clip_path,
+            'clip_seconds': 8.0,
+            'enable_video_clip': bool(PREVIEW_CLIP_AVAILABLE and self._clip_player is not None),
             'filters': [item.text() for item in self.filter_list.selectedItems()],
             'zoom_p': self._subs_preview_zoom_p(),
             'overlay_file': self.overlay_path.text().strip() or None,
-            'overlay_pos': self.overlay_pos_combo.currentText(),
+            'overlay_alignment': self._overlay_alignment_value(),
+            'overlay_margin_v': self.overlay_margin_v_spin.value(),
+            'overlay_margin_lr': self.overlay_margin_lr_spin.value(),
             'overlay_scale_p': self.overlay_scale_slider.value(),
             'output_format': self.output_format_combo.currentText(),
             'blur_background': self.blur_background_checkbox.isChecked(),
-            'crop_filter': crop_filter
+            'crop_filter': crop_filter,
+            'overlay_chromakey': _ch['enabled'],
+            'overlay_chromakey_color': _ch['color'],
+            'overlay_chromakey_similarity': _ch['similarity'],
+            'overlay_chromakey_blend': _ch['blend'],
         }
         
         self.set_controls_enabled(False)
-        self.preview_label.setText('Генерация предпросмотра...')
+        self.main_preview.set_message('Генерация предпросмотра...')
         
         self.parent_window.temp_files.append(temp_preview_path)
+        if temp_clip_path:
+            self.parent_window.temp_files.append(temp_clip_path)
         self.preview_thread = PreviewWorker(params)
         self.preview_thread.finished_signal.connect(self.on_preview_finished)
         self.preview_thread.error_signal.connect(self.on_preview_error)
         self.preview_thread.start()
     
-    def on_preview_finished(self, image_path):
-        if os.path.exists(image_path):
-            pixmap = QPixmap(image_path)
+    def on_preview_finished(self, png_path, clip_path):
+        if os.path.exists(png_path):
+            pixmap = QPixmap(png_path)
             if pixmap.isNull():
-                self.preview_label.setText('Ошибка: файл предпросмотра повреждён')
+                self.main_preview.set_message('Ошибка: файл предпросмотра повреждён')
                 self._preview_frame_pixmap = None
                 self._preview_signature_pending = None
             else:
-                self.preview_label.setPixmap(
-                    pixmap.scaled(
-                        self.preview_label.size(),
-                        Qt.KeepAspectRatio,
-                        Qt.SmoothTransformation
-                    )
-                )
                 if self._preview_signature_pending is not None:
                     self._preview_signature = self._preview_signature_pending
                 self._preview_signature_pending = None
                 self._preview_frame_pixmap = pixmap
         else:
-            self.preview_label.setText('Ошибка: файл предпросмотра не найден')
+            self.main_preview.set_message('Ошибка: файл предпросмотра не найден')
             self._preview_signature_pending = None
         
         self.update_subtitle_on_video_preview()
+
+        self._clip_last_path = None
+        clip_abs = os.path.abspath(clip_path) if clip_path else ''
+        if (
+            clip_abs
+            and os.path.isfile(clip_abs)
+            and os.path.getsize(clip_abs) > 0
+            and self._clip_player is not None
+        ):
+            self._clip_last_path = clip_abs
+            self.btn_preview_video_mode.setEnabled(True)
+            self._clip_player.setMedia(QMediaContent(QUrl.fromLocalFile(clip_abs)))
+            self._clip_player.play()
+            self.preview_stack.setCurrentIndex(0)
+            self.btn_preview_video_mode.setChecked(True)
+        else:
+            self.btn_preview_video_mode.setEnabled(False)
+            self.preview_stack.setCurrentIndex(1)
+            self.btn_preview_still_mode.setChecked(True)
+
         self.set_controls_enabled(True)
+
+    def _on_clip_media_status(self, status):
+        if not self._clip_player:
+            return
+        if not PREVIEW_CLIP_AVAILABLE:
+            return
+        if status == QMediaPlayer.EndOfMedia:
+            self._clip_player.setPosition(0)
+            self._clip_player.play()
+
+    def _set_preview_stack_visual(self, page: int):
+        if page == 0 and not self._clip_last_path:
+            self.preview_stack.setCurrentIndex(1)
+            self.btn_preview_still_mode.setChecked(True)
+            return
+        self.preview_stack.setCurrentIndex(page)
+        if page == 0 and self._clip_player and self._clip_last_path:
+            self._clip_player.play()
+        elif self._clip_player:
+            self._clip_player.pause()
+        if page == 0:
+            self.btn_preview_video_mode.setChecked(True)
+        else:
+            self.btn_preview_still_mode.setChecked(True)
     
     def on_preview_error(self, error_msg):
-        self.preview_label.setText('Ошибка генерации предпросмотра')
+        if self._clip_player is not None:
+            self._clip_player.stop()
+        self._clip_last_path = None
+        self.btn_preview_video_mode.setEnabled(False)
+        self.preview_stack.setCurrentIndex(1)
+        self.btn_preview_still_mode.setChecked(True)
+        self.main_preview.set_message('Ошибка генерации предпросмотра')
         self._preview_frame_pixmap = None
         self._preview_signature_pending = None
         self.update_subtitle_on_video_preview()
@@ -1407,7 +1711,6 @@ class ProcessingWidgetContent(QWidget):
     
     def set_controls_enabled(self, enabled):
         self.process_button.setEnabled(enabled)
-        self.yt_add_button.setEnabled(enabled)
         self.preview_button.setEnabled(enabled)
         self.video_list_widget.setEnabled(enabled)
     
@@ -1439,13 +1742,37 @@ class ProcessingWidgetContent(QWidget):
         self.refresh_video_list_display()
     
     def on_select_overlay(self):
-        overlay_filter = 'Файлы наложения (*.png *.jpg *.jpeg *.bmp *.gif);;Все файлы (*)'
+        overlay_filter = (
+            'Баннеры (*.png *.jpg *.jpeg *.bmp *.gif *.mp4 *.mov *.webm *.mkv *.m4v);;'
+            'Изображения (*.png *.jpg *.jpeg *.bmp *.gif);;'
+            'Видео (*.mp4 *.mov *.webm *.mkv *.m4v);;'
+            'Все файлы (*)'
+        )
         fs, _ = QFileDialog.getOpenFileNames(
-            self, 'Выберите файл для наложения (PNG, JPG, GIF)', '',
+            self, 'Файл баннера (картинка, GIF или видео MP4/MOV)', '',
             overlay_filter
         )
         if fs:
             self.overlay_path.setText(fs[0])
+
+    def on_pick_overlay_chroma_color(self):
+        c = QColorDialog.getColor(QColor(self.overlay_chroma_color_hex), self, 'Цвет хромакея')
+        if c.isValid():
+            self.overlay_chroma_color_hex = c.name().upper()
+            self.overlay_chroma_color_preview.setStyleSheet(
+                f'background: {self.overlay_chroma_color_hex}; border: 1px solid #666;'
+            )
+            self.update_subtitle_on_video_preview()
+            self.schedule_effects_preview_refresh(0)
+
+    def _overlay_chroma_params(self):
+        """Параметры chromakey для FFmpeg (float similarity/blend)."""
+        return {
+            'enabled': self.overlay_chroma_check.isChecked(),
+            'color': self.overlay_chroma_color_hex,
+            'similarity': max(0.01, min(0.8, self.overlay_chroma_sim_spin.value() * 0.01)),
+            'blend': max(0.0, min(0.5, self.overlay_chroma_blend_spin.value() * 0.01)),
+        }
     
     def on_add_files(self):
         file_filter = 'Видео и GIF (*.mp4 *.mov *.avi *.mkv *.flv *.wmv *.gif);;Все файлы (*)'
@@ -1548,8 +1875,14 @@ class ProcessingWidgetContent(QWidget):
             'viral_duration': self.viral_duration_spin.value(),
             'viral_count': self.viral_count_spin.value(),
             'overlay_file': self.overlay_path.text().strip(),
-            'overlay_pos': self.overlay_pos_combo.currentText(),
+            'overlay_alignment': self._overlay_alignment_value(),
+            'overlay_margin_v': self.overlay_margin_v_spin.value(),
+            'overlay_margin_lr': self.overlay_margin_lr_spin.value(),
             'overlay_scale': self.overlay_scale_slider.value(),
+            'overlay_chroma_enabled': self.overlay_chroma_check.isChecked(),
+            'overlay_chroma_color': self.overlay_chroma_color_hex,
+            'overlay_chroma_sim': self.overlay_chroma_sim_spin.value(),
+            'overlay_chroma_blend': self.overlay_chroma_blend_spin.value(),
             'subtitle_mode': subs_mode,
             'subtitle_srt_path': self.subs_srt_path.text().strip(),
             'subtitle_model': self.subs_model_combo.currentText(),
@@ -1618,10 +1951,39 @@ class ProcessingWidgetContent(QWidget):
 
         # Наложения и субтитры
         self.overlay_path.setText(preset.get('overlay_file', ''))
-        overlay_pos = preset.get('overlay_pos', self.overlay_pos_combo.currentText())
-        if self.overlay_pos_combo.findText(overlay_pos) >= 0:
-            self.overlay_pos_combo.setCurrentText(overlay_pos)
+        try:
+            o_al = int(preset.get('overlay_alignment', 0))
+        except (TypeError, ValueError):
+            o_al = 0
+        if o_al < 1 or o_al > 9:
+            legacy = preset.get('overlay_pos')
+            if isinstance(legacy, str) and legacy in OVERLAY_LEGACY_POS_TO_ALIGNMENT:
+                o_al = OVERLAY_LEGACY_POS_TO_ALIGNMENT[legacy]
+            else:
+                o_al = 5
+        _idx_ov = -1
+        for i in range(self.overlay_position_combo.count()):
+            raw = self.overlay_position_combo.itemData(i)
+            try:
+                if int(raw) == o_al:
+                    _idx_ov = i
+                    break
+            except (TypeError, ValueError):
+                continue
+        if _idx_ov >= 0:
+            self.overlay_position_combo.setCurrentIndex(_idx_ov)
+        self.overlay_margin_v_spin.setValue(int(preset.get('overlay_margin_v', 0)))
+        self.overlay_margin_lr_spin.setValue(int(preset.get('overlay_margin_lr', 0)))
         self.overlay_scale_slider.setValue(int(preset.get('overlay_scale', 100)))
+        self.overlay_chroma_check.setChecked(bool(preset.get('overlay_chroma_enabled', False)))
+        _och = preset.get('overlay_chroma_color', '#00FF00')
+        if isinstance(_och, str) and _och.startswith('#') and len(_och) == 7:
+            self.overlay_chroma_color_hex = _och.upper()
+        self.overlay_chroma_color_preview.setStyleSheet(
+            f'background: {self.overlay_chroma_color_hex}; border: 1px solid #666;'
+        )
+        self.overlay_chroma_sim_spin.setValue(int(preset.get('overlay_chroma_sim', 15)))
+        self.overlay_chroma_blend_spin.setValue(int(preset.get('overlay_chroma_blend', 8)))
 
         subs_mode = preset.get('subtitle_mode', 'none')
         self.subs_off_radio.setChecked(subs_mode == 'none')
@@ -1775,6 +2137,7 @@ class ProcessingWidgetContent(QWidget):
         }
         
         # Создание worker'а
+        _och = self._overlay_chroma_params()
         self.processing_thread = Worker(
             files=video_files,
             filters=[item.text() for item in self.filter_list.selectedItems()],
@@ -1787,8 +2150,14 @@ class ProcessingWidgetContent(QWidget):
             speed_min=self.speed_min_spin.value(),
             speed_max=self.speed_max_spin.value(),
             overlay_file=self.overlay_path.text().strip() or None,
-            overlay_pos=self.overlay_pos_combo.currentText(),
+            overlay_alignment=self._overlay_alignment_value(),
+            overlay_margin_v=self.overlay_margin_v_spin.value(),
+            overlay_margin_lr=self.overlay_margin_lr_spin.value(),
             overlay_scale_p=self.overlay_scale_slider.value(),
+            overlay_chromakey=_och['enabled'],
+            overlay_chromakey_color=_och['color'],
+            overlay_chromakey_similarity=_och['similarity'],
+            overlay_chromakey_blend=_och['blend'],
             out_dir=out_dir,
             mute_audio=self.mute_checkbox.isChecked(),
             output_format=self.output_format_combo.currentText(),

@@ -9,7 +9,7 @@ try:
 except NameError:
     _SPEC_DIR = os.getcwd()
 
-from PyInstaller.utils.hooks import collect_data_files
+from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 _datas = []
 _datas += collect_data_files('qtawesome')
@@ -21,6 +21,22 @@ for _name in ('ffmpeg.exe', 'ffprobe.exe', 'yt-dlp.exe'):
     _p = os.path.join(_SPEC_DIR, 'bin', _name)
     if os.path.isfile(_p):
         _datas.append((_p, 'bin'))
+
+_whisper_hi = [
+    'faster_whisper',
+    'ctranslate2',
+    'av',
+    'av.audio',
+    'tiktoken',
+    'tiktoken_ext',
+    'whisper',
+    'whisper.normalizers',
+    'whisper.model',
+]
+try:
+    _whisper_hi += collect_submodules('faster_whisper')
+except Exception:
+    pass
 
 _a = Analysis(
     ['main.py'],
@@ -40,7 +56,7 @@ _a = Analysis(
         'googleapiclient.discovery_cache',
         'googleapiclient.discovery_cache.file_cache',
         'uritemplate',
-    ],
+    ] + _whisper_hi,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

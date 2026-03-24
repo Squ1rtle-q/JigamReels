@@ -457,6 +457,13 @@ def _transcribe_with_external_whisper_subprocess(
     """
     import tempfile
 
+    # PyInstaller: sys.executable — это сам .exe приложения, а не python.exe.
+    # Команда `ReelsMakerPro.exe -m whisper` снова запускает GUI → второе окно.
+    if getattr(sys, 'frozen', False):
+        raise RuntimeError(
+            'whisper subprocess недоступен в собранном exe (нельзя использовать тот же исполняемый файл).'
+        )
+
     out_dir = tempfile.gettempdir()
     resolved_model = _resolve_external_whisper_model_name(model_name)
     base_name = os.path.splitext(os.path.basename(audio_path))[0]

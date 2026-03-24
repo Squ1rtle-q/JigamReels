@@ -43,8 +43,14 @@ class Worker(QThread):
         speed_min: int,
         speed_max: int,
         overlay_file: Optional[str],
-        overlay_pos: str,
+        overlay_alignment: int,
+        overlay_margin_v: int,
+        overlay_margin_lr: int,
         overlay_scale_p: int,
+        overlay_chromakey: bool,
+        overlay_chromakey_color: str,
+        overlay_chromakey_similarity: float,
+        overlay_chromakey_blend: float,
         out_dir: str,
         mute_audio: bool,
         output_format: str,
@@ -74,8 +80,14 @@ class Worker(QThread):
         self.speed_min = speed_min
         self.speed_max = speed_max
         self.overlay_file = overlay_file
-        self.overlay_pos = overlay_pos
+        self.overlay_alignment = overlay_alignment
+        self.overlay_margin_v = overlay_margin_v
+        self.overlay_margin_lr = overlay_margin_lr
         self.overlay_scale_p = overlay_scale_p
+        self.overlay_chromakey = overlay_chromakey
+        self.overlay_chromakey_color = overlay_chromakey_color
+        self.overlay_chromakey_similarity = overlay_chromakey_similarity
+        self.overlay_chromakey_blend = overlay_chromakey_blend
         self.out_dir = out_dir
         self.mute_audio = mute_audio
         self.output_format = output_format
@@ -219,8 +231,14 @@ class Worker(QThread):
                             zoom_p=current_zoom,
                             speed_p=current_speed,
                             overlay_file=self.overlay_file,
-                            overlay_pos=self.overlay_pos,
+                            overlay_alignment=self.overlay_alignment,
+                            overlay_margin_v=self.overlay_margin_v,
+                            overlay_margin_lr=self.overlay_margin_lr,
                             overlay_scale_p=self.overlay_scale_p,
+                            overlay_chromakey=self.overlay_chromakey,
+                            overlay_chromakey_color=self.overlay_chromakey_color,
+                            overlay_chromakey_similarity=self.overlay_chromakey_similarity,
+                            overlay_chromakey_blend=self.overlay_chromakey_blend,
                             output_format=self.output_format,
                             blur_background=self.blur_background,
                             mute_audio=self.mute_audio,

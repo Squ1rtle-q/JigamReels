@@ -67,5 +67,10 @@ def main():
 
 
 if __name__ == "__main__":
+    # Windows + PyInstaller: дочерние процессы (multiprocessing в зависимостях) не должны
+    # повторно выполнять main() и открывать второе окно Qt.
+    import multiprocessing
+
+    multiprocessing.freeze_support()
     main()
     
