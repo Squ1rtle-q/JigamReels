@@ -7,6 +7,39 @@
 
 ReelsMaker Pro — это мощное приложение для обработки видео с возможностью загрузки на YouTube и использованием искусственного интеллекта для автоматической генерации метаданных.
 
+## Быстрый старт (Windows)
+
+Ниже два варианта. Если вы не хотите разбираться с Python — выбирайте вариант 1.
+
+### Вариант 1 (самый простой): запуск EXE
+
+1. Откройте страницу репозитория и скачайте файл **`ReelsMakerPro.exe`** из раздела **Releases**.
+2. Скопируйте `ReelsMakerPro.exe` в папку (например, `D:\ReelsMakerPro\app\`).
+3. Запустите `ReelsMakerPro.exe` двойным кликом.
+
+Что важно:
+- При первом запуске автосубтитры могут занять время, потому что Whisper/модели загружаются из интернета.
+- Для загрузки на YouTube потребуется настройка API (см. раздел “YouTube API” ниже).
+
+### Вариант 2: запуск из Python (если EXE нет)
+
+1. Установите **Python 3.11** с сайта https://www.python.org/downloads/windows/
+   - Во время установки обязательно поставьте галочку **“Add python.exe to PATH”**.
+2. Установите **FFmpeg** и **FFprobe**:
+   - Можно поставить через `PATH` (как ниже в “Системные требования”).
+   - Либо положить файлы `ffmpeg.exe` и `ffprobe.exe` в папку `bin\` в корне проекта.
+3. Установите зависимости:
+```powershell
+cd <папка_проекта>
+python -m venv venv
+venv\Scripts\activate
+pip install -r requirements.txt
+```
+4. Запуск:
+```powershell
+python main.py
+```
+
 ## Функциональность
 
 ### 🎬 Обработка видео
@@ -78,8 +111,8 @@ yt-dlp --version
 
 ### 1. Клонирование репозитория
 ```bash
-git clone https://github.com/nellimonix/ReelsMakerPro.git
-cd ReelsMakerPro
+git clone https://github.com/Squ1rtle-q/JigamReels.git
+cd JigamReels
 ```
 
 ### 2. Создание виртуального окружения
@@ -133,6 +166,6 @@ pyinstaller ReelsMakerPro.spec
 
 ## Поддержка
 
-Если у вас возникли вопросы или проблемы, создайте [Issue](https://github.com/nellimonix/ReelsMakerPro/issues) в этом репозитории.
+Если у вас возникли вопросы или проблемы, создайте [Issue](https://github.com/Squ1rtle-q/JigamReels/issues) в этом репозитории.
 
 ---
