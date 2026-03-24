@@ -1,16 +1,17 @@
 import sys
 import os
 import ctypes
-from PyQt5.QtWidgets import QApplication
-from PyQt5.QtGui import QIcon
 import logging
 
-from os.path import dirname, abspath
+if not getattr(sys, 'frozen', False):
+    _project_root = os.path.dirname(os.path.abspath(__file__))
+    if _project_root not in sys.path:
+        sys.path.insert(0, _project_root)
 
-from utils.path_utils import get_ffmpeg_path
-project_root = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, project_root)
+from PyQt5.QtWidgets import QApplication
+from PyQt5.QtGui import QIcon
 
+from utils.path_utils import get_ffmpeg_path, get_logs_directory
 from ui.main_window import VideoUnicApp
 from utils.constants import APP_NAME, APP_VERSION, FFMPEG_EXE_PATH
 
@@ -21,7 +22,13 @@ def set_app_user_model_id(app_id):
 
 
 def main():
-    log_file_path = os.path.join(project_root, "crash_log.log")
+    if getattr(sys, 'frozen', False):
+        log_file_path = os.path.join(get_logs_directory(), "crash_log.log")
+    else:
+        log_file_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "crash_log.log",
+        )
     
     logging.basicConfig(
         level=logging.INFO,

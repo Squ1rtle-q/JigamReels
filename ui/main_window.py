@@ -5,15 +5,19 @@ import tempfile
 import uuid
 import shutil
 import logging
+import copy
 
 from PyQt5.QtCore import Qt, QPoint, pyqtSignal, QThread
-from PyQt5.QtGui import QFontMetrics, QIcon, QPixmap
+from PyQt5.QtGui import (
+    QFontMetrics, QIcon, QPixmap, QFont, QFontDatabase,
+    QColor, QPainter, QPainterPath, QPen
+)
 from PyQt5.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QListWidget, QAbstractItemView, QFileDialog, QSpinBox, QLineEdit,
     QMessageBox, QProgressBar, QComboBox, QGroupBox, QRadioButton,
     QButtonGroup, QCheckBox, QSplitter, QListWidgetItem, QTabWidget,
-    QMenu, QFrame, QStackedWidget, QInputDialog, QPlainTextEdit,
+    QMenu, QFrame, QStackedWidget, QInputDialog, QPlainTextEdit, QColorDialog,
     QSlider, QApplication
 )
 
@@ -240,6 +244,22 @@ class ProcessingWidgetContent(QWidget):
         audio_tab_layout = QVBoxLayout(audio_tab)
         
         # === ГЛАВНАЯ ВКЛАДКА ===
+
+        # Группа пресетов
+        self.presets_group = QGroupBox('Пресеты обработки')
+        presets_layout = QVBoxLayout(self.presets_group)
+        presets_row = QHBoxLayout()
+        self.presets_combo = QComboBox()
+        self.presets_combo.setPlaceholderText('Выберите пресет')
+        btn_preset_apply = QPushButton('Применить')
+        btn_preset_save = QPushButton('Сохранить текущий')
+        btn_preset_delete = QPushButton('Удалить')
+        presets_row.addWidget(self.presets_combo, 1)
+        presets_row.addWidget(btn_preset_apply)
+        presets_row.addWidget(btn_preset_save)
+        presets_row.addWidget(btn_preset_delete)
+        presets_layout.addLayout(presets_row)
+        main_tab_layout.addWidget(self.presets_group)
         
         # Группа формата вывода
         self.output_format_group = QGroupBox('Формат и кодирование')
@@ -418,6 +438,33 @@ class ProcessingWidgetContent(QWidget):
         self.speed_dynamic_widget.setVisible(False)
         
         transform_tab_layout.addWidget(self.speed_group)
+
+        # Группа авто-нарезки виральных моментов
+        self.viral_group = QGroupBox('Виральные моменты')
+        viral_layout = QVBoxLayout(self.viral_group)
+
+        self.viral_enable_checkbox = QCheckBox('Авто-нарезка самых динамичных моментов')
+        self.viral_enable_checkbox.setToolTip(
+            'Анализирует видео по динамике сцен и громкости, затем сохраняет лучшие фрагменты'
+        )
+        viral_layout.addWidget(self.viral_enable_checkbox)
+
+        viral_params_layout = QHBoxLayout()
+        viral_params_layout.addWidget(QLabel('Длительность (сек):'))
+        self.viral_duration_spin = QSpinBox()
+        self.viral_duration_spin.setRange(5, 60)
+        self.viral_duration_spin.setValue(15)
+        viral_params_layout.addWidget(self.viral_duration_spin)
+
+        viral_params_layout.addWidget(QLabel('Кол-во клипов:'))
+        self.viral_count_spin = QSpinBox()
+        self.viral_count_spin.setRange(1, 10)
+        self.viral_count_spin.setValue(3)
+        viral_params_layout.addWidget(self.viral_count_spin)
+        viral_params_layout.addStretch()
+        viral_layout.addLayout(viral_params_layout)
+
+        transform_tab_layout.addWidget(self.viral_group)
         transform_tab_layout.addStretch()
         
         # === ВКЛАДКА НАЛОЖЕНИЙ ===
@@ -505,7 +552,7 @@ class ProcessingWidgetContent(QWidget):
         whisper_row1.addWidget(QLabel('Модель:'))
         self.subs_model_combo = QComboBox()
         self.subs_model_combo.addItems(WHISPER_MODELS)
-        self.subs_model_combo.setCurrentText('base')
+        self.subs_model_combo.setCurrentText('distil-large-v3')
         whisper_row1.addWidget(self.subs_model_combo)
         subs_whisper_layout.addLayout(whisper_row1)
         
@@ -532,13 +579,71 @@ class ProcessingWidgetContent(QWidget):
         
         # Общие настройки стиля
         common_style_layout = QHBoxLayout()
+        common_style_layout.addWidget(QLabel('Шрифт (системный):'))
+        self.subs_font_combo = QComboBox()
+        self.populate_subtitle_fonts()
+        common_style_layout.addWidget(self.subs_font_combo, 1)
+
+        common_style_layout.addWidget(QLabel('Начертание:'))
+        self.subs_font_style_combo = QComboBox()
+        self.subs_font_style_combo.addItems([
+            'Обычный',
+            'Курсив',
+            'Полужирный',
+            'Полужирный курсив',
+            'Подчеркнутый',
+            'Подчеркнутый курсив'
+        ])
+        common_style_layout.addWidget(self.subs_font_style_combo)
+
         common_style_layout.addWidget(QLabel('Размер (pt):'))
         self.subs_size_spin = QSpinBox()
         self.subs_size_spin.setRange(10, 100)
         self.subs_size_spin.setValue(36)
         common_style_layout.addWidget(self.subs_size_spin)
+        common_style_layout.addWidget(QLabel('Обводка:'))
+        self.subs_outline_spin = QSpinBox()
+        self.subs_outline_spin.setRange(0, 8)
+        self.subs_outline_spin.setValue(2)
+        common_style_layout.addWidget(self.subs_outline_spin)
+        common_style_layout.addWidget(QLabel('Контур:'))
+        self.subs_outline_mode_combo = QComboBox()
+        self.subs_outline_mode_combo.addItems(['Снаружи', 'Внутри'])
+        common_style_layout.addWidget(self.subs_outline_mode_combo)
         common_style_layout.addStretch(1)
         subs_main_layout.addLayout(common_style_layout)
+
+        subs_color_layout = QHBoxLayout()
+        self.subs_text_color_btn = QPushButton('Цвет текста')
+        self.subs_text_color_preview = QLabel('   ')
+        self.subs_text_color_preview.setFixedWidth(28)
+        self.subs_text_color_preview.setStyleSheet('background: #FFFFFF; border: 1px solid #666;')
+        self.subs_text_color_hex = '#FFFFFF'
+
+        self.subs_outline_color_btn = QPushButton('Цвет обводки')
+        self.subs_outline_color_preview = QLabel('   ')
+        self.subs_outline_color_preview.setFixedWidth(28)
+        self.subs_outline_color_preview.setStyleSheet('background: #000000; border: 1px solid #666;')
+        self.subs_outline_color_hex = '#000000'
+
+        subs_color_layout.addWidget(self.subs_text_color_btn)
+        subs_color_layout.addWidget(self.subs_text_color_preview)
+        subs_color_layout.addSpacing(8)
+        subs_color_layout.addWidget(self.subs_outline_color_btn)
+        subs_color_layout.addWidget(self.subs_outline_color_preview)
+        subs_color_layout.addStretch()
+        subs_main_layout.addLayout(subs_color_layout)
+
+        # Превью стиля субтитров
+        preview_group = QGroupBox('Превью субтитров')
+        preview_layout = QVBoxLayout(preview_group)
+        self.subs_style_preview = QLabel('Это пример того, как будут выглядеть субтитры')
+        self.subs_style_preview.setAlignment(Qt.AlignCenter)
+        self.subs_style_preview.setWordWrap(True)
+        self.subs_style_preview.setMinimumHeight(90)
+        self.subs_style_preview.setStyleSheet('background: #FFFFFF; color: #000000; border: 1px solid #999;')
+        preview_layout.addWidget(self.subs_style_preview)
+        subs_main_layout.addWidget(preview_group)
         
         effects_tab_layout.addWidget(self.subs_group)
         effects_tab_layout.addStretch()
@@ -665,18 +770,32 @@ class ProcessingWidgetContent(QWidget):
         self.preview_button.clicked.connect(self.on_update_preview)
         btn_browse_srt.clicked.connect(self.on_browse_srt)
         self.subs_mode_group.buttonClicked.connect(self.on_subs_mode_changed)
+        self.subs_text_color_btn.clicked.connect(self.on_pick_subs_text_color)
+        self.subs_outline_color_btn.clicked.connect(self.on_pick_subs_outline_color)
+        self.subs_font_combo.currentTextChanged.connect(self.update_subtitle_style_preview)
+        self.subs_font_style_combo.currentTextChanged.connect(self.update_subtitle_style_preview)
+        self.subs_size_spin.valueChanged.connect(self.update_subtitle_style_preview)
+        self.subs_outline_spin.valueChanged.connect(self.update_subtitle_style_preview)
+        self.subs_outline_mode_combo.currentTextChanged.connect(self.update_subtitle_style_preview)
         browse_ol_audio_btn.clicked.connect(self.on_browse_overlay_audio)
         clear_ol_audio_btn.clicked.connect(self.overlay_audio_path_edit.clear)
         self.process_button.clicked.connect(self.start_processing)
+        btn_preset_save.clicked.connect(self.on_save_preset)
+        btn_preset_apply.clicked.connect(self.on_apply_preset)
+        btn_preset_delete.clicked.connect(self.on_delete_preset)
         
         # Инициализация состояний
         self.on_subs_mode_changed()
         self.on_output_format_changed(self.output_format_combo.currentText())
         self.on_zoom_mode_changed()
         self.on_speed_mode_changed()
+        self.on_viral_mode_changed()
+        self.update_subtitle_style_preview()
+        self.load_presets_from_config()
         
         # Drag & Drop
         self.video_list_widget.files_dropped.connect(self.refresh_video_list_display)
+        self.viral_enable_checkbox.toggled.connect(self.on_viral_mode_changed)
     
     def on_subs_mode_changed(self):
         is_from_file = self.subs_from_file_radio.isChecked()
@@ -700,6 +819,105 @@ class ProcessingWidgetContent(QWidget):
         )
         if fs:
             self.overlay_audio_path_edit.setText(fs)
+
+    def on_pick_subs_text_color(self):
+        color = QColorDialog.getColor()
+        if color.isValid():
+            self.subs_text_color_hex = color.name().upper()
+            self.subs_text_color_preview.setStyleSheet(
+                f'background: {self.subs_text_color_hex}; border: 1px solid #666;'
+            )
+            self.update_subtitle_style_preview()
+
+    def on_pick_subs_outline_color(self):
+        color = QColorDialog.getColor()
+        if color.isValid():
+            self.subs_outline_color_hex = color.name().upper()
+            self.subs_outline_color_preview.setStyleSheet(
+                f'background: {self.subs_outline_color_hex}; border: 1px solid #666;'
+            )
+            self.update_subtitle_style_preview()
+
+    def populate_subtitle_fonts(self):
+        db = QFontDatabase()
+        families = sorted(db.families())
+        self.subs_font_combo.clear()
+        self.subs_font_combo.addItems(families)
+
+        default_family = self.font().family()
+        default_idx = self.subs_font_combo.findText(default_family)
+        if default_idx >= 0:
+            self.subs_font_combo.setCurrentIndex(default_idx)
+        elif families:
+            self.subs_font_combo.setCurrentIndex(0)
+
+    def _subtitle_font_flags(self):
+        style = self.subs_font_style_combo.currentText().lower()
+        return {
+            'bold': 'полужирный' in style,
+            'italic': 'курсив' in style,
+            'underline': 'подчеркнутый' in style
+        }
+
+    def update_subtitle_style_preview(self):
+        font_family = self.subs_font_combo.currentText().strip() or 'Arial'
+        font_size = self.subs_size_spin.value()
+        text_color = self.subs_text_color_hex
+        outline_color = self.subs_outline_color_hex
+        outline = self.subs_outline_spin.value()
+        outline_mode = self.subs_outline_mode_combo.currentText()
+        font_flags = self._subtitle_font_flags()
+        font = QFont(font_family, font_size)
+        font.setBold(font_flags['bold'])
+        font.setItalic(font_flags['italic'])
+        font.setUnderline(font_flags['underline'])
+
+        self.subs_style_preview.setStyleSheet('background: #FFFFFF; border: 1px solid #999;')
+        self.subs_style_preview.setText('')
+
+        pixmap_w = max(320, self.subs_style_preview.width() - 4)
+        pixmap_h = max(90, self.subs_style_preview.height() - 4)
+        pixmap = QPixmap(pixmap_w, pixmap_h)
+        pixmap.fill(Qt.white)
+
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.setRenderHint(QPainter.TextAntialiasing, True)
+        painter.setFont(font)
+
+        preview_text = 'Это пример того, как будут выглядеть субтитры'
+        fm = painter.fontMetrics()
+        text_w = fm.horizontalAdvance(preview_text)
+        text_h = fm.height()
+        x = (pixmap_w - text_w) / 2
+        y = (pixmap_h + text_h * 0.35) / 2
+
+        path = QPainterPath()
+        path.addText(x, y, font, preview_text)
+
+        if outline > 0:
+            pen = QPen(QColor(outline_color))
+            pen.setJoinStyle(Qt.RoundJoin)
+            pen.setWidth(max(1, outline * 2))
+            if outline_mode == 'Снаружи':
+                # Сначала контур, потом заливка: текст не "съедается" изнутри.
+                painter.setPen(pen)
+                painter.setBrush(Qt.NoBrush)
+                painter.drawPath(path)
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(QColor(text_color))
+                painter.drawPath(path)
+            else:
+                # Внутренний контур: более плотный "жирный" вид букв.
+                painter.setPen(pen)
+                painter.setBrush(QColor(text_color))
+                painter.drawPath(path)
+        else:
+            painter.setPen(QColor(text_color))
+            painter.drawText(int(x), int(y), preview_text)
+
+        painter.end()
+        self.subs_style_preview.setPixmap(pixmap)
     
     def on_add_from_youtube(self):
         url = self.yt_url_input.text().strip()
@@ -890,6 +1108,210 @@ class ProcessingWidgetContent(QWidget):
         is_dynamic = self.speed_dynamic_radio.isChecked()
         self.speed_static_widget.setVisible(not is_dynamic)
         self.speed_dynamic_widget.setVisible(is_dynamic)
+
+    def on_viral_mode_changed(self):
+        enabled = self.viral_enable_checkbox.isChecked()
+        self.viral_duration_spin.setEnabled(enabled)
+        self.viral_count_spin.setEnabled(enabled)
+
+    def load_presets_from_config(self):
+        stored = self.parent_window.config_manager.get_setting('processing_presets', {})
+        self.processing_presets = stored if isinstance(stored, dict) else {}
+        self.refresh_presets_combo()
+
+    def refresh_presets_combo(self):
+        self.presets_combo.clear()
+        self.presets_combo.addItems(sorted(self.processing_presets.keys()))
+
+    def _collect_current_processing_settings(self):
+        selected_filters = [self.filter_list.item(i).text() for i in range(self.filter_list.count())
+                            if self.filter_list.item(i).isSelected()]
+
+        if self.subs_from_file_radio.isChecked():
+            subs_mode = 'srt_file'
+        elif self.subs_generate_radio.isChecked():
+            subs_mode = 'whisper'
+        else:
+            subs_mode = 'none'
+
+        font_flags = self._subtitle_font_flags()
+        return {
+            'output_format': self.output_format_combo.currentText(),
+            'blur_background': self.blur_background_checkbox.isChecked(),
+            'codec_label': self.codec_combo.currentText(),
+            'auto_crop': self.auto_crop_checkbox.isChecked(),
+            'filters': selected_filters,
+            'zoom_mode': 'dynamic' if self.zoom_dynamic_radio.isChecked() else 'static',
+            'zoom_static': self.zoom_static_spin.value(),
+            'zoom_min': self.zoom_min_spin.value(),
+            'zoom_max': self.zoom_max_spin.value(),
+            'speed_mode': 'dynamic' if self.speed_dynamic_radio.isChecked() else 'static',
+            'speed_static': self.speed_static_spin.value(),
+            'speed_min': self.speed_min_spin.value(),
+            'speed_max': self.speed_max_spin.value(),
+            'viral_enabled': self.viral_enable_checkbox.isChecked(),
+            'viral_duration': self.viral_duration_spin.value(),
+            'viral_count': self.viral_count_spin.value(),
+            'overlay_file': self.overlay_path.text().strip(),
+            'overlay_pos': self.overlay_pos_combo.currentText(),
+            'subtitle_mode': subs_mode,
+            'subtitle_srt_path': self.subs_srt_path.text().strip(),
+            'subtitle_model': self.subs_model_combo.currentText(),
+            'subtitle_language': self.subs_lang_combo.currentText(),
+            'subtitle_words_per_line': self.subs_words_spin.value(),
+            'subtitle_font': self.subs_font_combo.currentText().strip(),
+            'subtitle_font_style': self.subs_font_style_combo.currentText(),
+            'subtitle_font_size': self.subs_size_spin.value(),
+            'subtitle_outline': self.subs_outline_spin.value(),
+            'subtitle_outline_mode': self.subs_outline_mode_combo.currentText(),
+            'subtitle_text_color': self.subs_text_color_hex,
+            'subtitle_outline_color': self.subs_outline_color_hex,
+            'subtitle_bold': font_flags['bold'],
+            'subtitle_italic': font_flags['italic'],
+            'subtitle_underline': font_flags['underline'],
+            'mute_audio': self.mute_checkbox.isChecked(),
+            'orig_volume': self.orig_vol_slider.value(),
+            'overlay_audio_file': self.overlay_audio_path_edit.text().strip(),
+            'overlay_volume': self.over_vol_slider.value(),
+            'strip_metadata': self.parent_window.settings_widget.strip_meta_checkbox.isChecked()
+        }
+
+    def _apply_processing_settings(self, preset):
+        # Меню и трансформация
+        output_format = preset.get('output_format', self.output_format_combo.currentText())
+        if self.output_format_combo.findText(output_format) >= 0:
+            self.output_format_combo.setCurrentText(output_format)
+        self.blur_background_checkbox.setChecked(bool(preset.get('blur_background', False)))
+
+        codec_label = preset.get('codec_label', self.codec_combo.currentText())
+        if self.codec_combo.findText(codec_label) >= 0:
+            self.codec_combo.setCurrentText(codec_label)
+
+        self.auto_crop_checkbox.setChecked(bool(preset.get('auto_crop', False)))
+
+        wanted_filters = set(preset.get('filters', []))
+        for i in range(self.filter_list.count()):
+            item = self.filter_list.item(i)
+            item.setSelected(item.text() in wanted_filters)
+
+        if preset.get('zoom_mode') == 'dynamic':
+            self.zoom_dynamic_radio.setChecked(True)
+        else:
+            self.zoom_static_radio.setChecked(True)
+        self.zoom_static_spin.setValue(int(preset.get('zoom_static', 100)))
+        self.zoom_min_spin.setValue(int(preset.get('zoom_min', 80)))
+        self.zoom_max_spin.setValue(int(preset.get('zoom_max', 120)))
+        self.on_zoom_mode_changed()
+
+        if preset.get('speed_mode') == 'dynamic':
+            self.speed_dynamic_radio.setChecked(True)
+        else:
+            self.speed_static_radio.setChecked(True)
+        self.speed_static_spin.setValue(int(preset.get('speed_static', 100)))
+        self.speed_min_spin.setValue(int(preset.get('speed_min', 90)))
+        self.speed_max_spin.setValue(int(preset.get('speed_max', 110)))
+        self.on_speed_mode_changed()
+
+        self.viral_enable_checkbox.setChecked(bool(preset.get('viral_enabled', False)))
+        self.viral_duration_spin.setValue(int(preset.get('viral_duration', 15)))
+        self.viral_count_spin.setValue(int(preset.get('viral_count', 3)))
+        self.on_viral_mode_changed()
+
+        # Наложения и субтитры
+        self.overlay_path.setText(preset.get('overlay_file', ''))
+        overlay_pos = preset.get('overlay_pos', self.overlay_pos_combo.currentText())
+        if self.overlay_pos_combo.findText(overlay_pos) >= 0:
+            self.overlay_pos_combo.setCurrentText(overlay_pos)
+
+        subs_mode = preset.get('subtitle_mode', 'none')
+        self.subs_off_radio.setChecked(subs_mode == 'none')
+        self.subs_from_file_radio.setChecked(subs_mode == 'srt_file')
+        self.subs_generate_radio.setChecked(subs_mode == 'whisper')
+        self.on_subs_mode_changed()
+
+        self.subs_srt_path.setText(preset.get('subtitle_srt_path', ''))
+        model = preset.get('subtitle_model', self.subs_model_combo.currentText())
+        if self.subs_model_combo.findText(model) >= 0:
+            self.subs_model_combo.setCurrentText(model)
+        lang = preset.get('subtitle_language', self.subs_lang_combo.currentText())
+        if self.subs_lang_combo.findText(lang) >= 0:
+            self.subs_lang_combo.setCurrentText(lang)
+        self.subs_words_spin.setValue(int(preset.get('subtitle_words_per_line', 4)))
+
+        font_name = preset.get('subtitle_font', self.subs_font_combo.currentText())
+        if self.subs_font_combo.findText(font_name) >= 0:
+            self.subs_font_combo.setCurrentText(font_name)
+
+        style_name = preset.get('subtitle_font_style', self.subs_font_style_combo.currentText())
+        if self.subs_font_style_combo.findText(style_name) >= 0:
+            self.subs_font_style_combo.setCurrentText(style_name)
+
+        self.subs_size_spin.setValue(int(preset.get('subtitle_font_size', 36)))
+        self.subs_outline_spin.setValue(int(preset.get('subtitle_outline', 2)))
+        outline_mode = preset.get('subtitle_outline_mode', self.subs_outline_mode_combo.currentText())
+        if self.subs_outline_mode_combo.findText(outline_mode) >= 0:
+            self.subs_outline_mode_combo.setCurrentText(outline_mode)
+
+        self.subs_text_color_hex = preset.get('subtitle_text_color', '#FFFFFF')
+        self.subs_outline_color_hex = preset.get('subtitle_outline_color', '#000000')
+        self.subs_text_color_preview.setStyleSheet(
+            f'background: {self.subs_text_color_hex}; border: 1px solid #666;'
+        )
+        self.subs_outline_color_preview.setStyleSheet(
+            f'background: {self.subs_outline_color_hex}; border: 1px solid #666;'
+        )
+        self.update_subtitle_style_preview()
+
+        # Аудио + глобальные настройки
+        self.mute_checkbox.setChecked(bool(preset.get('mute_audio', False)))
+        self.orig_vol_slider.setValue(int(preset.get('orig_volume', 100)))
+        self.overlay_audio_path_edit.setText(preset.get('overlay_audio_file', ''))
+        self.over_vol_slider.setValue(int(preset.get('overlay_volume', 100)))
+        self.parent_window.settings_widget.strip_meta_checkbox.setChecked(
+            bool(preset.get('strip_metadata', True))
+        )
+
+    def on_save_preset(self):
+        preset_name, ok = QInputDialog.getText(self, 'Сохранить пресет', 'Название пресета:')
+        preset_name = (preset_name or '').strip()
+        if not ok or not preset_name:
+            return
+
+        self.processing_presets[preset_name] = copy.deepcopy(self._collect_current_processing_settings())
+        self.parent_window.config_manager.set_setting('processing_presets', self.processing_presets)
+        self.refresh_presets_combo()
+        self.presets_combo.setCurrentText(preset_name)
+        self.status_label.setText(f'Пресет "{preset_name}" сохранен')
+
+    def on_apply_preset(self):
+        preset_name = self.presets_combo.currentText().strip()
+        if not preset_name:
+            QMessageBox.warning(self, 'Пресет не выбран', 'Выберите пресет для применения.')
+            return
+        preset = self.processing_presets.get(preset_name)
+        if not preset:
+            QMessageBox.warning(self, 'Ошибка', f'Пресет "{preset_name}" не найден.')
+            return
+        self._apply_processing_settings(preset)
+        self.status_label.setText(f'Пресет "{preset_name}" применен')
+
+    def on_delete_preset(self):
+        preset_name = self.presets_combo.currentText().strip()
+        if not preset_name:
+            QMessageBox.warning(self, 'Пресет не выбран', 'Выберите пресет для удаления.')
+            return
+        reply = QMessageBox.question(
+            self, 'Удаление пресета',
+            f'Удалить пресет "{preset_name}"?',
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+        if reply != QMessageBox.Yes:
+            return
+        self.processing_presets.pop(preset_name, None)
+        self.parent_window.config_manager.set_setting('processing_presets', self.processing_presets)
+        self.refresh_presets_combo()
+        self.status_label.setText(f'Пресет "{preset_name}" удален')
     
     def start_processing(self):
         video_files = [
@@ -917,7 +1339,17 @@ class ProcessingWidgetContent(QWidget):
             subtitle_settings['language'] = self.subs_lang_combo.currentText()
             subtitle_settings['words_per_line'] = self.subs_words_spin.value()
         
-        subtitle_settings['style'] = {'font_size': self.subs_size_spin.value()}
+        subtitle_settings['style'] = {
+            'font_size': self.subs_size_spin.value(),
+            'font_name': self.subs_font_combo.currentText().strip() or 'Arial',
+            'font_bold': self._subtitle_font_flags()['bold'],
+            'font_italic': self._subtitle_font_flags()['italic'],
+            'font_underline': self._subtitle_font_flags()['underline'],
+            'text_color': self.subs_text_color_hex,
+            'outline_color': self.subs_outline_color_hex,
+            'outline': self.subs_outline_spin.value(),
+            'outline_mode': self.subs_outline_mode_combo.currentText().lower(),
+        }
         
         # Создание worker'а
         self.processing_thread = Worker(
@@ -943,7 +1375,10 @@ class ProcessingWidgetContent(QWidget):
             auto_crop=self.auto_crop_checkbox.isChecked(),
             overlay_audio=self.overlay_audio_path_edit.text().strip() or None,
             original_volume=self.orig_vol_slider.value(),
-            overlay_volume=self.over_vol_slider.value()
+            overlay_volume=self.over_vol_slider.value(),
+            viral_clips_enabled=self.viral_enable_checkbox.isChecked(),
+            viral_clip_duration=self.viral_duration_spin.value(),
+            viral_clip_count=self.viral_count_spin.value()
         )
         
         # Подключение сигналов

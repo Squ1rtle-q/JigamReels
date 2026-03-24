@@ -14,9 +14,12 @@ config/
 .env
 .env.local
 
-# Бинарные файлы и внешние утилиты
-bin/
+# Бинарные файлы и внешние утилиты (инструкция в bin/README.md — в репозитории)
+bin/*
+!bin/README.md
 ffmpeg/
+
+# Собранный exe — не коммитим (релизы выкладывайте в GitHub Releases)
 *.exe
 
 # Логи
@@ -43,7 +46,7 @@ tmp/
 build/
 dist/
 *.egg-info/
-*.spec
+main.spec
 
 # Дополнительные файлы
 models/

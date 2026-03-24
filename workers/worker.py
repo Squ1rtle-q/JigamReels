@@ -3,10 +3,12 @@ import os
 import random
 import subprocess
 import uuid
+import tempfile
+import shutil
 from typing import List, Optional, Dict
 
-from utils.ffmpeg_utils import process_single, detect_crop_dimensions
-from utils.subtitle_utils import extract_audio, generate_srt_from_whisper
+from utils.ffmpeg_utils import process_single, detect_crop_dimensions, detect_viral_moments, burn_subtitles_postprocess
+from utils.subtitle_utils import extract_audio, generate_srt_from_whisper, build_segment_srt
 
 
 class Worker(QThread):
@@ -42,7 +44,10 @@ class Worker(QThread):
         auto_crop: bool,
         overlay_audio: Optional[str],
         original_volume: int,
-        overlay_volume: int
+        overlay_volume: int,
+        viral_clips_enabled: bool = False,
+        viral_clip_duration: int = 15,
+        viral_clip_count: int = 3
     ):
         super().__init__()
         
@@ -68,6 +73,9 @@ class Worker(QThread):
         self.subtitle_settings = subtitle_settings
         self.auto_crop = auto_crop
         self.overlay_audio = overlay_audio
+        self.viral_clips_enabled = viral_clips_enabled
+        self.viral_clip_duration = viral_clip_duration
+        self.viral_clip_count = viral_clip_count
         
         # Конвертация процентов в десятичные значения
         self.original_volume = original_volume / 100
@@ -145,7 +153,11 @@ class Worker(QThread):
             # Инициализация переменных
             srt_path = None
             temp_audio_path = None
+            temp_audio_paths = []
+            full_audio_path = None
+            full_srt_path = None
             crop_filter = None
+            segment_srt_paths = []
             
             try:
                 try:
@@ -155,66 +167,141 @@ class Worker(QThread):
                         crop_filter = detect_crop_dimensions(in_file_path)
                         self.status_update.emit('Обработка...')
                     
-                    # Обработка субтитров
                     subtitle_mode = self.subtitle_settings.get('mode')
-                    
-                    if subtitle_mode == 'whisper':
-                        # Генерация субтитров через Whisper
-                        temp_dir = self.out_dir
-                        temp_audio_path = os.path.join(temp_dir, f'{uuid.uuid4()}.wav')
-                        srt_path = os.path.join(temp_dir, f'{uuid.uuid4()}.srt')
-                        
-                        self.status_update.emit(f"Извлечение аудио из '{base_name}'...")
-                        extract_audio(in_file_path, temp_audio_path)
-                        
-                        self.status_update.emit('Распознавание речи... (может занять много времени)')
-                        generate_srt_from_whisper(
-                            audio_path=temp_audio_path,
-                            srt_path=srt_path,
-                            model_name=self.subtitle_settings.get('model'),
-                            language=self.subtitle_settings.get('language'),
-                            words_per_line=self.subtitle_settings.get('words_per_line')
+
+                    segment_specs = [(None, None, '')]
+                    if self.viral_clips_enabled:
+                        self.status_update.emit('Поиск самых динамичных/виральных моментов...')
+                        viral_segments = detect_viral_moments(
+                            in_file_path,
+                            clip_duration=self.viral_clip_duration,
+                            max_clips=self.viral_clip_count
                         )
-                        
-                        self.file_processing.emit(base_name)
-                        
-                    elif subtitle_mode == 'srt_file':
+                        segment_specs = [
+                            (start, seg_duration, f'_viral_{idx + 1}')
+                            for idx, (start, seg_duration) in enumerate(viral_segments)
+                        ]
+
+                    # Обработка субтитров (проверка входных данных)
+                    if subtitle_mode == 'srt_file':
                         # Использование готового SRT файла
                         srt_path = self.subtitle_settings.get('srt_path')
                         if not srt_path or not os.path.exists(srt_path):
                             raise FileNotFoundError(f'Файл субтитров не найден: {srt_path}')
+
+                    for seg_i, (seg_start, seg_duration, seg_suffix) in enumerate(segment_specs, start=1):
+                        current_zoom = self.pick_zoom()
+                        current_speed = self.pick_speed()
+
+                        current_out_file_path = out_file_path
+                        if seg_suffix:
+                            current_out_file_path = os.path.join(
+                                self.out_dir,
+                                f'{name_part}{suffix}{seg_suffix}.mp4'
+                            )
+
+                        # Этап 1: обрабатываем/режем БЕЗ субтитров.
+                        process_single(
+                            in_path=in_file_path,
+                            out_path=current_out_file_path,
+                            filters=self.filters,
+                            zoom_p=current_zoom,
+                            speed_p=current_speed,
+                            overlay_file=self.overlay_file,
+                            overlay_pos=self.overlay_pos,
+                            output_format=self.output_format,
+                            blur_background=self.blur_background,
+                            mute_audio=self.mute_audio,
+                            strip_metadata=self.strip_metadata,
+                            codec=self.codec,
+                            srt_path=None,
+                            subtitle_style=self.subtitle_settings.get('style', {}),
+                            crop_filter=crop_filter,
+                            overlay_audio_path=self.overlay_audio,
+                            original_volume=self.original_volume,
+                            overlay_volume=self.overlay_volume,
+                            progress_callback=self.file_progress.emit,
+                            trim_start=seg_start,
+                            trim_duration=seg_duration
+                        )
+
+                        # Этап 2: отдельное распознавание/вшивание субтитров в уже нарезанный файл.
+                        effective_srt_path = None
+                        if subtitle_mode == 'whisper':
+                            seg_audio_path = os.path.join(tempfile.gettempdir(), f'{uuid.uuid4()}.wav')
+                            seg_srt_path = os.path.join(tempfile.gettempdir(), f'{uuid.uuid4()}.srt')
+                            self.status_update.emit(
+                                f'Распознавание речи для готового клипа {seg_i}/{len(segment_specs)}...'
+                            )
+                            extract_audio(current_out_file_path, seg_audio_path)
+                            generate_srt_from_whisper(
+                                audio_path=seg_audio_path,
+                                srt_path=seg_srt_path,
+                                model_name=self.subtitle_settings.get('model'),
+                                language=self.subtitle_settings.get('language'),
+                                words_per_line=self.subtitle_settings.get('words_per_line')
+                            )
+                            temp_audio_paths.append(seg_audio_path)
+                            segment_srt_paths.append(seg_srt_path)
+                            effective_srt_path = seg_srt_path
+                        elif subtitle_mode == 'srt_file':
+                            effective_srt_path = srt_path
+                            if seg_start is not None and seg_duration is not None:
+                                seg_srt_path = os.path.join(tempfile.gettempdir(), f'{uuid.uuid4()}.srt')
+                                effective_srt_path = build_segment_srt(
+                                    source_srt_path=srt_path,
+                                    out_srt_path=seg_srt_path,
+                                    segment_start=seg_start,
+                                    segment_duration=seg_duration
+                                )
+                                segment_srt_paths.append(seg_srt_path)
+
+                        if effective_srt_path and os.path.exists(effective_srt_path) and os.path.getsize(effective_srt_path) > 0:
+                            try:
+                                tmp_sub_out = os.path.join(self.out_dir, f'{uuid.uuid4()}_subpass.mp4')
+                                burn_subtitles_postprocess(
+                                    in_path=current_out_file_path,
+                                    out_path=tmp_sub_out,
+                                    srt_path=effective_srt_path,
+                                    subtitle_style=self.subtitle_settings.get('style', {}),
+                                    codec=self.codec,
+                                    plain_subtitles=False
+                                )
+                                if os.path.exists(tmp_sub_out):
+                                    os.remove(current_out_file_path)
+                                    os.replace(tmp_sub_out, current_out_file_path)
+                            except Exception as post_err:
+                                print(f'Postprocess subtitle burn failed (styled): {post_err}')
+                                try:
+                                    # fallback: простой режим без force_style
+                                    tmp_sub_out_plain = os.path.join(self.out_dir, f'{uuid.uuid4()}_subpass_plain.mp4')
+                                    burn_subtitles_postprocess(
+                                        in_path=current_out_file_path,
+                                        out_path=tmp_sub_out_plain,
+                                        srt_path=effective_srt_path,
+                                        subtitle_style=self.subtitle_settings.get('style', {}),
+                                        codec=self.codec,
+                                        plain_subtitles=True
+                                    )
+                                    if os.path.exists(tmp_sub_out_plain):
+                                        os.remove(current_out_file_path)
+                                        os.replace(tmp_sub_out_plain, current_out_file_path)
+                                        self.status_update.emit('Субтитры вшиты в простом режиме.')
+                                    else:
+                                        raise RuntimeError('Plain subtitle postprocess did not produce output file.')
+                                except Exception as plain_err:
+                                    try:
+                                        sidecar_srt = os.path.splitext(current_out_file_path)[0] + '.srt'
+                                        shutil.copyfile(effective_srt_path, sidecar_srt)
+                                        self.status_update.emit('Вшивание сабов не удалось, сохранен .srt рядом с видео.')
+                                    except Exception:
+                                        pass
+                                    print(f'Postprocess subtitle burn failed (plain): {plain_err}')
+                        elif subtitle_mode != 'none':
+                            self.status_update.emit('Субтитры пустые/некорректные, вшивание пропущено.')
+                        self.output_paths.append(current_out_file_path)
                     
-                    # Выбор параметров zoom и speed
-                    current_zoom = self.pick_zoom()
-                    current_speed = self.pick_speed()
-                    
-                    # Вызов основной функции обработки
-                    process_single(
-                        in_path=in_file_path,
-                        out_path=out_file_path,
-                        filters=self.filters,
-                        zoom_p=current_zoom,
-                        speed_p=current_speed,
-                        overlay_file=self.overlay_file,
-                        overlay_pos=self.overlay_pos,
-                        output_format=self.output_format,
-                        blur_background=self.blur_background,
-                        mute_audio=self.mute_audio,
-                        strip_metadata=self.strip_metadata,
-                        codec=self.codec,
-                        srt_path=srt_path,
-                        subtitle_style=self.subtitle_settings.get('style', {}),
-                        crop_filter=crop_filter,
-                        overlay_audio_path=self.overlay_audio,
-                        original_volume=self.original_volume,
-                        overlay_volume=self.overlay_volume,
-                        progress_callback=self.file_progress.emit
-                    )
-                    
-                    # Добавление пути к результатам
-                    self.output_paths.append(out_file_path)
-                    
-                    # Обновление общего прогресса
+                    # Обновление общего прогресса (по исходным файлам)
                     self.progress.emit(i + 1, total_files)
                     
                 except Exception as e:
@@ -232,9 +319,17 @@ class Worker(QThread):
                 # Очистка временных файлов
                 if temp_audio_path and os.path.exists(temp_audio_path):
                     os.remove(temp_audio_path)
+
+                for seg_audio in temp_audio_paths:
+                    if seg_audio and os.path.exists(seg_audio):
+                        os.remove(seg_audio)
                 
                 if srt_path and subtitle_mode == 'whisper' and os.path.exists(srt_path):
                     os.remove(srt_path)
+                
+                for seg_srt in segment_srt_paths:
+                    if seg_srt and os.path.exists(seg_srt):
+                        os.remove(seg_srt)
         
         # Завершение работы
         if self._is_running:

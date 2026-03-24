@@ -60,7 +60,15 @@ CODECS = {
     "AMD (H.265 | hevc_amf)": "hevc_amf",
 }
 
-WHISPER_MODELS = ["tiny", "base", "small", "medium", "large"]
+WHISPER_MODELS = [
+    "distil-large-v3",
+    "large-v3",
+    "large",
+    "medium",
+    "small",
+    "base",
+    "tiny",
+]
 
 WHISPER_LANGUAGES = [
     "Auto-detect", "Russian", "English", "Ukrainian",

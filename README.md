@@ -114,40 +114,18 @@ python main.py
 
 **[Инструкция по настройке YouTube API](instruction.md)**
 
-## Компиляция в EXE файл
+## Компиляция в EXE (Windows)
 
-### Установка PyInstaller
-```bash
-pip install pyinstaller
+Актуальная пошаговая инструкция: **[BUILD.md](BUILD.md)** (PyInstaller, файл `ReelsMakerPro.spec`, утилиты в `bin/` — см. [bin/README.md](bin/README.md)).
+
+Кратко:
+
+```powershell
+pip install -r requirements.txt -r requirements-build.txt
+pyinstaller ReelsMakerPro.spec
 ```
 
-### Базовая компиляция
-```bash
-pyinstaller --onefile --windowed --icon=resources/icon.ico main.py
-```
-
-### Компиляция с встроенными зависимостями
-
-Для создания полностью независимого EXE файла с встроенными FFmpeg, FFprobe и yt-dlp:
-
-1. Создайте папку `bin` в корне проекта
-2. Скопируйте в неё файлы:
-   - `ffmpeg.exe`
-   - `ffprobe.exe`
-   - `yt-dlp.exe`
-
-3. Выполните компиляцию с дополнительными данными:
-```bash
-pyinstaller --onefile --windowed --icon=resources/icon.ico --add-data "bin;bin" --add-data "resources;resources" main.py
-```
-
-### Дополнительные опции компиляции
-Для оптимизации размера и производительности:
-```bash
-pyinstaller --onefile --windowed --icon=resources/icon.ico --add-data "bin;bin" --add-data "resources;resources" --optimize=2 --strip main.py
-```
-
-После компиляции EXE файл будет находиться в папке `dist/`.
+Готовый файл: `dist\ReelsMakerPro.exe`. Готовый `.exe` в Git не коммитится; для пользователей выкладывайте его в **GitHub Releases**.
 
 ## Лицензия
 
