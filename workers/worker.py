@@ -18,7 +18,9 @@ from utils.ffmpeg_utils import (
     get_video_dimensions,
     reels_letterbox_vertical_inset_px,
 )
-from utils.subtitle_utils import extract_audio, generate_srt_from_whisper, build_segment_srt
+from utils.subtitle_utils import extract_audio, generate_srt_from_whisper, build_segment_srt, censor_words_in_text
+from utils.ai_helper import generate_smart_title, sanitize_title_for_filename
+from utils.file_utils import safe_filename
 
 
 class Worker(QThread):
@@ -64,7 +66,8 @@ class Worker(QThread):
         overlay_volume: int,
         viral_clips_enabled: bool = False,
         viral_clip_duration: int = 15,
-        viral_clip_count: int = 3
+        viral_clip_count: int = 3,
+        censor_words: Optional[List[str]] = None
     ):
         super().__init__()
         
@@ -100,6 +103,7 @@ class Worker(QThread):
         self.viral_clips_enabled = viral_clips_enabled
         self.viral_clip_duration = viral_clip_duration
         self.viral_clip_count = viral_clip_count
+        self.censor_words = censor_words or []
         
         # Конвертация процентов в десятичные значения
         self.original_volume = original_volume / 100
@@ -181,6 +185,8 @@ class Worker(QThread):
             full_srt_path = None
             crop_filter = None
             segment_srt_paths = []
+            full_transcription_text = []  # Для сбора текста из всех сегментов транскрипции
+            smart_title = None  # Автоматически сгенерированное название
             
             try:
                 try:
@@ -269,7 +275,8 @@ class Worker(QThread):
                                 srt_path=seg_srt_path,
                                 model_name=self.subtitle_settings.get('model'),
                                 language=self.subtitle_settings.get('language'),
-                                words_per_line=self.subtitle_settings.get('words_per_line')
+                                words_per_line=self.subtitle_settings.get('words_per_line'),
+                                censor_words=self.censor_words if self.censor_words else None
                             )
                             temp_audio_paths.append(seg_audio_path)
                             segment_srt_paths.append(seg_srt_path)
@@ -338,7 +345,64 @@ class Worker(QThread):
                                     logging.exception('Postprocess subtitle burn failed (plain)')
                         elif subtitle_mode != 'none':
                             self.status_update.emit('Субтитры пустые/некорректные, вшивание пропущено.')
+                        
+                        # Собираем текст из субтитров для автоматического названия видео
+                        if effective_srt_path and os.path.exists(effective_srt_path):
+                            try:
+                                srt_text = self._extract_text_from_srt(effective_srt_path)
+                                if srt_text:
+                                    full_transcription_text.append(srt_text)
+                            except Exception as srt_read_err:
+                                logging.warning(f'Не удалось прочитать текст из SRT: {srt_read_err}')
+                        
                         self.output_paths.append(current_out_file_path)
+                    
+                    # Генерируем умное название на основе полной транскрипции
+                    if full_transcription_text and self.output_paths:
+                        try:
+                            combined_text = ' '.join(full_transcription_text)
+                            if combined_text.strip():
+                                self.status_update.emit('Генерируем название видео через ИИ...')
+                                smart_title = generate_smart_title(combined_text)
+                                
+                                # Проверяем, что название успешно сгенерировано (не None и не "Video")
+                                if smart_title and smart_title.lower() != 'video':
+                                    # Применяем цензуру к названию
+                                    if self.censor_words:
+                                        smart_title = censor_words_in_text(smart_title, self.censor_words, '*')
+                                    
+                                    # Очищаем название для использования в имени файла
+                                    clean_title = sanitize_title_for_filename(smart_title)
+                                    clean_title = safe_filename(clean_title)
+                                    
+                                    # Переименовываем основной файл (первый или единственный)
+                                    if self.output_paths:
+                                        original_output_path = self.output_paths[0]
+                                        original_dir = os.path.dirname(original_output_path)
+                                        _, ext = os.path.splitext(original_output_path)
+                                        ext = ext.strip()  # Убираем случайные пробелы
+                                        
+                                        # Извлекаем только время (часы-минуты) из file_unique
+                                        # file_unique формат: 2025-02-26_18-45-30_abc12345
+                                        time_part = file_unique.split('_')[1][:5] if '_' in file_unique else '00-00'
+                                        
+                                        # Формируем новое имя через пробелы (без лишних replace)
+                                        # clean_title уже содержит пробелы, нужно просто их сохранить
+                                        base_new_name = f'{clean_title} ({time_part}){ext}'
+                                        # Убираем множественные пробелы если они появились
+                                        base_new_name = ' '.join(base_new_name.split())
+                                        new_output_path = os.path.join(original_dir, base_new_name)
+                                        
+                                        try:
+                                            if os.path.exists(original_output_path):
+                                                os.replace(original_output_path, new_output_path)
+                                                self.output_paths[0] = new_output_path
+                                                self.status_update.emit(f'Файл переименован: {clean_title}')
+                                                logging.info(f'Видео переименовано на: {base_new_name}')
+                                        except Exception as rename_err:
+                                            logging.warning(f'Не удалось переименовать файл: {rename_err}')
+                        except Exception as title_err:
+                            logging.warning(f'Ошибка при генерации названия: {title_err}')
                     
                     # Обновление общего прогресса (по исходным файлам)
                     self.progress.emit(i + 1, total_files)
@@ -376,3 +440,38 @@ class Worker(QThread):
             self.finished.emit()
         else:
             print('Worker finished due to stop request.')
+    
+    def _extract_text_from_srt(self, srt_path: str) -> str:
+        """
+        Извлекает весь текст из SRT файла (без временных меток и индексов).
+        
+        Args:
+            srt_path: Путь к SRT файлу
+            
+        Returns:
+            Объединенный текст из всех субтитров
+        """
+        if not os.path.exists(srt_path):
+            return ""
+        
+        try:
+            with open(srt_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+            
+            # Парсим SRT: блоки разделены пустыми строками
+            # Каждый блок: индекс\nвремя\nтекст
+            blocks = [b.strip() for b in content.split('\n\n') if b.strip()]
+            text_lines = []
+            
+            for block in blocks:
+                lines = block.split('\n')
+                if len(lines) >= 3:
+                    # Текст идет с 3-й строки (индекс=0, время=1, текст=2+)
+                    text_lines.extend(lines[2:])
+            
+            # Объединяем в один текст
+            full_text = ' '.join(text_lines).strip()
+            return full_text
+        except Exception as e:
+            logging.error(f'Ошибка при извлечении текста из SRT: {e}')
+            return ""

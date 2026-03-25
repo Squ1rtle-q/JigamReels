@@ -25,6 +25,11 @@ ffmpeg/
 # Логи
 *.log
 
+# Аудиофайлы и субтитры
+*.wav
+*.srt
+*.ass
+
 # IDE и редакторы
 .vscode/
 .idea/
@@ -36,17 +41,28 @@ ffmpeg/
 .DS_Store
 Thumbs.db
 
+# Документация и черновики (инструкции находятся в репозитории)
+instruction.md
+BUILD.md
+CENSOR_GUIDE.md
+CENSOR_QUICK_START.md
+UI_CENSOR_USAGE.md
+changelog.txt
+
 # Временные файлы
 *.tmp
 *.temp
 temp/
 tmp/
+output/
+вывод/
+нарезки/
 
 # Сборка и дистрибутив
 build/
 dist/
 *.egg-info/
-main.spec
+*.spec
 
 # Дополнительные файлы
 models/

@@ -415,17 +415,25 @@ class ProcessingWidgetContent(QWidget):
         effects_tab_content = QWidget()
         effects_tab.setWidget(effects_tab_content)
         audio_tab = QWidget()
+        censor_tab = QScrollArea()
+        censor_tab.setWidgetResizable(True)
+        censor_tab.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        censor_tab.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        censor_tab_content = QWidget()
+        censor_tab.setWidget(censor_tab_content)
         
         tab_widget.addTab(main_tab, 'Меню')
         tab_widget.addTab(transform_tab, 'Трансформация')
         tab_widget.addTab(effects_tab, 'Наложение')
         tab_widget.addTab(audio_tab, 'Аудио')
+        tab_widget.addTab(censor_tab, 'Цензура')
         
         # Layouts для вкладок
         main_tab_layout = QVBoxLayout(main_tab)
         transform_tab_layout = QVBoxLayout(transform_tab)
         effects_tab_layout = QVBoxLayout(effects_tab_content)
         audio_tab_layout = QVBoxLayout(audio_tab)
+        censor_tab_layout = QVBoxLayout(censor_tab_content)
         
         # === ГЛАВНАЯ ВКЛАДКА ===
 
@@ -1018,6 +1026,74 @@ class ProcessingWidgetContent(QWidget):
         
         audio_tab_layout.addWidget(self.overlay_audio_group)
         audio_tab_layout.addStretch()
+        
+        # === ВКЛАДКА ЦЕНЗУРА ===
+        
+        # Группа опций цензуры
+        self.censor_options_group = QGroupBox('Опции цензуры')
+        censor_options_layout = QVBoxLayout(self.censor_options_group)
+        
+        self.censor_subtitles_check = QCheckBox('Цензурировать субтитры')
+        self.censor_subtitles_check.setToolTip('Применить цензуру к генерируемым субтитрам')
+        censor_options_layout.addWidget(self.censor_subtitles_check)
+        
+        self.censor_metadata_check = QCheckBox('Очищать метаданные')
+        self.censor_metadata_check.setToolTip('Автоматически очищать и оптимизировать название, описание и теги видео')
+        censor_options_layout.addWidget(self.censor_metadata_check)
+        
+        censor_tab_layout.addWidget(self.censor_options_group)
+        
+        # Группа управления черным списком
+        self.censor_list_group = QGroupBox('Черный список слов')
+        censor_list_layout = QVBoxLayout(self.censor_list_group)
+        
+        # Список слов
+        self.censor_list_widget = QListWidget()
+        self.censor_list_widget.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.censor_list_widget.setMinimumHeight(200)
+        censor_list_layout.addWidget(QLabel('Слова для цензуры:'))
+        censor_list_layout.addWidget(self.censor_list_widget)
+        
+        # Добавление новых слов
+        input_row = QHBoxLayout()
+        self.censor_word_input = QLineEdit()
+        self.censor_word_input.setPlaceholderText('Введите слово для добавления в черный список...')
+        self.censor_word_input.returnPressed.connect(self.on_censor_add_word)
+        
+        btn_add_word = QPushButton('Добавить')
+        btn_add_word.setFixedWidth(100)
+        btn_add_word.clicked.connect(self.on_censor_add_word)
+        
+        btn_remove_word = QPushButton('Удалить')
+        btn_remove_word.setFixedWidth(100)
+        btn_remove_word.clicked.connect(self.on_censor_remove_word)
+        
+        input_row.addWidget(self.censor_word_input, 1)
+        input_row.addWidget(btn_add_word)
+        input_row.addWidget(btn_remove_word)
+        
+        censor_list_layout.addLayout(input_row)
+        
+        # Кнопки для управления списком
+        buttons_row = QHBoxLayout()
+        btn_load_from_file = QPushButton('Загрузить из файла')
+        btn_load_from_file.clicked.connect(self.on_censor_load_from_file)
+        
+        btn_save_to_file = QPushButton('Сохранить в файл')
+        btn_save_to_file.clicked.connect(self.on_censor_save_to_file)
+        
+        btn_clear_list = QPushButton('Очистить список')
+        btn_clear_list.clicked.connect(self.on_censor_clear_list)
+        
+        buttons_row.addWidget(btn_load_from_file)
+        buttons_row.addWidget(btn_save_to_file)
+        buttons_row.addWidget(btn_clear_list)
+        buttons_row.addStretch()
+        
+        censor_list_layout.addLayout(buttons_row)
+        
+        censor_tab_layout.addWidget(self.censor_list_group)
+        censor_tab_layout.addStretch()
         
         # === НИЖНИЕ ЭЛЕМЕНТЫ УПРАВЛЕНИЯ ===
         
@@ -1905,7 +1981,10 @@ class ProcessingWidgetContent(QWidget):
             'orig_volume': self.orig_vol_slider.value(),
             'overlay_audio_file': self.overlay_audio_path_edit.text().strip(),
             'overlay_volume': self.over_vol_slider.value(),
-            'strip_metadata': self.parent_window.settings_widget.strip_meta_checkbox.isChecked()
+            'strip_metadata': self.parent_window.settings_widget.strip_meta_checkbox.isChecked(),
+            'censor_subtitles': self.censor_subtitles_check.isChecked(),
+            'censor_metadata': self.censor_metadata_check.isChecked(),
+            'censor_list': self.get_censor_list()
         }
 
     def _apply_processing_settings(self, preset):
@@ -2047,6 +2126,9 @@ class ProcessingWidgetContent(QWidget):
         self.parent_window.settings_widget.strip_meta_checkbox.setChecked(
             bool(preset.get('strip_metadata', True))
         )
+        
+        # Загружаем опции цензуры
+        self.load_censor_settings_from_preset(preset)
 
     def on_save_preset(self):
         preset_name, ok = QInputDialog.getText(self, 'Сохранить пресет', 'Название пресета:')
@@ -2171,7 +2253,8 @@ class ProcessingWidgetContent(QWidget):
             overlay_volume=self.over_vol_slider.value(),
             viral_clips_enabled=self.viral_enable_checkbox.isChecked(),
             viral_clip_duration=self.viral_duration_spin.value(),
-            viral_clip_count=self.viral_count_spin.value()
+            viral_clip_count=self.viral_count_spin.value(),
+            censor_words=self.get_censor_list()
         )
         
         # Подключение сигналов
@@ -2232,6 +2315,145 @@ class ProcessingWidgetContent(QWidget):
         self.set_controls_enabled(True)
         self.status_label.setText('Ошибка')
         self.processing_thread = None
+
+    # ==================== МЕТОДЫ ДЛЯ УПРАВЛЕНИЯ ЦЕНЗУРОЙ ====================
+    
+    def on_censor_add_word(self):
+        """Добавить слово в черный список"""
+        word = self.censor_word_input.text().strip()
+        if not word:
+            QMessageBox.warning(self, 'Ошибка', 'Введите слово для добавления')
+            return
+        
+        # Проверяем, что слова нет в списке
+        for i in range(self.censor_list_widget.count()):
+            if self.censor_list_widget.item(i).text().lower() == word.lower():
+                QMessageBox.warning(self, 'Ошибка', 'Это слово уже в списке')
+                return
+        
+        self.censor_list_widget.addItem(word)
+        self.censor_word_input.clear()
+        self.save_censor_list_to_config()
+    
+    def on_censor_remove_word(self):
+        """Удалить выбранные слова из черного списка"""
+        selected = self.censor_list_widget.selectedItems()
+        if not selected:
+            QMessageBox.warning(self, 'Ошибка', 'Выберите слова для удаления')
+            return
+        
+        for item in selected:
+            self.censor_list_widget.takeItem(self.censor_list_widget.row(item))
+        
+        self.save_censor_list_to_config()
+    
+    def on_censor_clear_list(self):
+        """Очистить весь черный список"""
+        reply = QMessageBox.question(
+            self, 'Подтверждение', 
+            'Очистить весь черный список?',
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+        if reply == QMessageBox.Yes:
+            self.censor_list_widget.clear()
+            self.save_censor_list_to_config()
+    
+    def on_censor_load_from_file(self):
+        """Загрузить черный список из файла"""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, 'Выберите файл черного списка', '',
+            'Text Files (*.txt);;All Files (*.*)'
+        )
+        
+        if not file_path:
+            return
+        
+        try:
+            from utils.subtitle_utils import load_censor_list_from_file
+            words = load_censor_list_from_file(file_path)
+            
+            # Очищаем текущий список или добавляем в существующий
+            reply = QMessageBox.question(
+                self, 'Загрузка', 
+                'Заменить текущий список или добавить слова?',
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.Yes
+            )
+            
+            if reply == QMessageBox.Yes:
+                self.censor_list_widget.clear()
+            
+            # Добавляем слова из файла
+            for word in words:
+                # Проверяем дубликаты
+                found = False
+                for i in range(self.censor_list_widget.count()):
+                    if self.censor_list_widget.item(i).text().lower() == word.lower():
+                        found = True
+                        break
+                
+                if not found:
+                    self.censor_list_widget.addItem(word)
+            
+            self.save_censor_list_to_config()
+            QMessageBox.information(self, 'Успех', f'Загружено {len(words)} слов из файла')
+            
+        except Exception as e:
+            QMessageBox.critical(self, 'Ошибка', f'Ошибка загрузки файла:\n{str(e)}')
+    
+    def on_censor_save_to_file(self):
+        """Сохранить черный список в файл"""
+        if self.censor_list_widget.count() == 0:
+            QMessageBox.warning(self, 'Пусто', 'Нечего сохранять - список пуст')
+            return
+        
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, 'Сохранить черный список', '',
+            'Text Files (*.txt);;All Files (*.*)'
+        )
+        
+        if not file_path:
+            return
+        
+        try:
+            words = [self.censor_list_widget.item(i).text() for i in range(self.censor_list_widget.count())]
+            
+            with open(file_path, 'w', encoding='utf-8') as f:
+                f.write('\n'.join(words))
+            
+            QMessageBox.information(self, 'Успех', f'Сохранено {len(words)} слов')
+            
+        except Exception as e:
+            QMessageBox.critical(self, 'Ошибка', f'Ошибка сохранения файла:\n{str(e)}')
+    
+    def get_censor_list(self):
+        """Получить текущий черный список"""
+        words = []
+        for i in range(self.censor_list_widget.count()):
+            words.append(self.censor_list_widget.item(i).text())
+        return words
+    
+    def save_censor_list_to_config(self):
+        """Сохранить черный список в конфиг"""
+        preset_name = self.presets_combo.currentText().strip()
+        if preset_name and preset_name in self.processing_presets:
+            self.processing_presets[preset_name]['censor_list'] = self.get_censor_list()
+            self.processing_presets[preset_name]['censor_subtitles'] = self.censor_subtitles_check.isChecked()
+            self.processing_presets[preset_name]['censor_metadata'] = self.censor_metadata_check.isChecked()
+            self.parent_window.config_manager.set_setting('processing_presets', self.processing_presets)
+    
+    def load_censor_settings_from_preset(self, preset):
+        """Загрузить опции цензуры из пресета"""
+        # Загружаем опции
+        self.censor_subtitles_check.setChecked(bool(preset.get('censor_subtitles', False)))
+        self.censor_metadata_check.setChecked(bool(preset.get('censor_metadata', False)))
+        
+        # Загружаем черный список
+        self.censor_list_widget.clear()
+        censor_list = preset.get('censor_list', [])
+        for word in censor_list:
+            self.censor_list_widget.addItem(word)
 
 
 class SettingsWidget(QWidget):

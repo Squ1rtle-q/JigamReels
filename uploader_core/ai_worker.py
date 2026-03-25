@@ -1,6 +1,7 @@
 import os
 from PyQt5.QtCore import QObject, pyqtSignal, QRunnable
 import json
+from typing import Optional, List
 
 
 class AIWorkerSignals(QObject):
@@ -13,9 +14,12 @@ class AIWorkerSignals(QObject):
 class AIWorker(QRunnable):
     """Воркер для обработки видео с помощью AI"""
     
-    def __init__(self, video_path):
+    def __init__(self, video_path, censor_words: Optional[List[str]] = None, 
+                 apply_metadata_cleanup: bool = True):
         super().__init__()
         self.video_path = video_path
+        self.censor_words = censor_words or []
+        self.apply_metadata_cleanup = apply_metadata_cleanup
         self.signals = AIWorkerSignals()
     
     def run(self):
@@ -24,6 +28,7 @@ class AIWorker(QRunnable):
             # Импортируем необходимые библиотеки
             import g4f
             import whisper
+            from utils.subtitle_utils import clean_metadata
             
             # Проверяем существование видеофайла
             if not os.path.exists(self.video_path):
@@ -65,6 +70,34 @@ class AIWorker(QRunnable):
             
             # Парсим JSON ответ
             metadata = json.loads(json_response_str)
+            
+            # Применяем очистку метаданных если требуется
+            if self.apply_metadata_cleanup:
+                metadata = clean_metadata(
+                    title=metadata.get('title', ''),
+                    description=metadata.get('description', ''),
+                    tags=metadata.get('tags', ''),
+                    words_to_censor=self.censor_words if self.censor_words else None
+                )
+            elif self.censor_words:
+                # Если только цензура без полной очистки
+                from utils.subtitle_utils import censor_words_in_text
+                metadata['title'] = censor_words_in_text(
+                    metadata.get('title', ''), 
+                    self.censor_words, 
+                    '*'
+                )
+                metadata['description'] = censor_words_in_text(
+                    metadata.get('description', ''), 
+                    self.censor_words, 
+                    '*'
+                )
+                # Обработка тегов
+                tags_str = metadata.get('tags', '')
+                if isinstance(tags_str, list):
+                    tags_str = ', '.join(tags_str)
+                cleaned = censor_words_in_text(tags_str, self.censor_words, '*')
+                metadata['tags'] = [t.strip() for t in cleaned.split(',') if t.strip()]
             
             # Отправляем сигнал об успешном завершении
             self.signals.finished.emit(metadata)

@@ -90,3 +90,68 @@ class ConfigManager:
         """Save the scheduled tasks."""
         self.schedule['tasks'] = tasks
         self.save_json(self.schedule_path, self.schedule)
+
+    def get_censor_list(self, list_name: str = 'default'):
+        """
+        Get a censor list by name.
+        
+        Args:
+            list_name: Name of the censor list ('default' or 'custom')
+            
+        Returns:
+            List of words to censor
+        """
+        censor_lists = self.config.get('censor_lists', {})
+        return censor_lists.get(list_name, [])
+
+    def set_censor_list(self, list_name: str, words: list):
+        """
+        Set a censor list.
+        
+        Args:
+            list_name: Name of the censor list to set
+            words: List of words to censor
+        """
+        if 'censor_lists' not in self.config:
+            self.config['censor_lists'] = {}
+        self.config['censor_lists'][list_name] = words
+        self.save_json(self.config_path, self.config)
+
+    def is_censor_enabled(self, preset_name: str, for_metadata: bool = False) -> bool:
+        """
+        Check if censoring is enabled for a preset.
+        
+        Args:
+            preset_name: Name of the processing preset
+            for_metadata: If True, check metadata censoring; if False, check subtitle censoring
+            
+        Returns:
+            True if censoring is enabled
+        """
+        presets = self.config.get('settings', {}).get('processing_presets', {})
+        preset = presets.get(preset_name, {})
+        
+        if for_metadata:
+            return preset.get('censor_metadata', False)
+        else:
+            return preset.get('censor_subtitles', False)
+
+    def set_censor_enabled(self, preset_name: str, enabled: bool, for_metadata: bool = False):
+        """
+        Enable or disable censoring for a preset.
+        
+        Args:
+            preset_name: Name of the processing preset
+            enabled: Whether to enable censoring
+            for_metadata: If True, set metadata censoring; if False, set subtitle censoring
+        """
+        presets = self.config.get('settings', {}).get('processing_presets', {})
+        if preset_name not in presets:
+            return
+        
+        if for_metadata:
+            presets[preset_name]['censor_metadata'] = enabled
+        else:
+            presets[preset_name]['censor_subtitles'] = enabled
+        
+        self.save_json(self.config_path, self.config)

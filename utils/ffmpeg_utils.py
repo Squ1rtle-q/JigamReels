@@ -1424,16 +1424,18 @@ def process_single(
     # Настройка видеокодека
     cmd.extend(['-c:v', codec])
     
-    if 'nvenc' in codec or 'amf' in codec:
-        cmd.extend(['-cq', '24'])
-    elif 'qsv' in codec:
-        cmd.extend(['-global_quality', '24'])
-    else:
-        cmd.extend(['-preset', 'veryfast', '-crf', '24'])
+    # Генерируем случайный битрейт от 4000k до 5000k для изменения хеша файла
+    random_bitrate = random.randint(4000, 5000)
     
-    # Удаление метаданных
-    if strip_metadata:
-        cmd.extend(['-map_metadata', '-1', '-map_chapters', '-1'])
+    if 'nvenc' in codec or 'amf' in codec:
+        cmd.extend(['-b:v', f'{random_bitrate}k', '-cq', '24'])
+    elif 'qsv' in codec:
+        cmd.extend(['-b:v', f'{random_bitrate}k', '-global_quality', '24'])
+    else:
+        cmd.extend(['-preset', 'veryfast', '-b:v', f'{random_bitrate}k'])
+    
+    # Удаление метаданных (очистка для изменения хеша)
+    cmd.extend(['-map_metadata', '-1', '-map_chapters', '-1'])
     
     # Дополнительные параметры
     if not is_gif_input and not overlay_audio_path:

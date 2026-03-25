@@ -7,6 +7,8 @@ import os
 import datetime
 import subprocess
 import sys
+import random
+import re
 from typing import Optional, List, Dict
 from utils.ffmpeg_utils import run_ffmpeg
 
@@ -147,7 +149,8 @@ def generate_srt_from_whisper(
     srt_path: str,
     model_name: str,
     language: str,
-    words_per_line: int
+    words_per_line: int,
+    censor_words: Optional[List[str]] = None
 ) -> str:
     """
     Генерирует SRT файл субтитров из аудиофайла используя Whisper AI.
@@ -158,6 +161,7 @@ def generate_srt_from_whisper(
         model_name: Название модели Whisper (tiny, base, small, medium, large)
         language: Язык для распознавания ("Auto-detect" для автоопределения)
         words_per_line: Количество слов в одной строке субтитров
+        censor_words: Опциональный список слов для цензурирования
         
     Returns:
         Путь к созданному SRT файлу
@@ -167,6 +171,7 @@ def generate_srt_from_whisper(
     """
     # Количество слов, которые показываются в одном "шаге" субтитра.
     words_per_line = max(1, int(words_per_line or 1))
+    censor_words = censor_words or []
 
     # Определяем язык для транскрипции
     if language != 'Auto-detect':
@@ -215,9 +220,18 @@ def generate_srt_from_whisper(
                     continue
                 c_start = seg_start + idx * chunk_dur
                 c_end = seg_end if idx == chunk_count - 1 else min(seg_end, c_start + chunk_dur)
+                # Очищение текста от лишних пробелов и прижание пунктуации
+                chunk_text = ' '.join(chunk)
+                # Жесткая очистка перед записью
+                # Удаляем пробелы ПЕРЕД знаками препинания
+                chunk_text = re.sub(r'\s+([,.!?])', r'\1', chunk_text)
+                # Гарантируем ровно один пробел ПОСЛЕ знаков препинания (если там не конец строки)
+                chunk_text = re.sub(r'([,.!?])(?!\s|$)', r'\1 ', chunk_text)
+                # Убираем двойные пробелы
+                chunk_text = re.sub(r'\s+', ' ', chunk_text).strip()
                 srt_content += f"{sub_index}\n"
                 srt_content += f"{_format_time(c_start)} --> {_format_time(c_end)}\n"
-                srt_content += f"{' '.join(chunk)}\n\n"
+                srt_content += f"{chunk_text}\n\n"
                 sub_index += 1
             continue
 
@@ -234,8 +248,15 @@ def generate_srt_from_whisper(
             start_time = _format_time(chunk[0]['start'])
             end_time = _format_time(chunk[-1]['end'])
             
-            # Объединяем слова в текст
+            # Объединяем слова в текст с чисткой пробелов
             text = ' '.join([word['word'] for word in chunk]).strip()
+            # Жесткая очистка перед записью
+            # Удаляем пробелы ПЕРЕД знаками препинания
+            text = re.sub(r'\s+([,.!?])', r'\1', text)
+            # Гарантируем ровно один пробел ПОСЛЕ знаков препинания (если там не конец строки)
+            text = re.sub(r'([,.!?])(?!\s|$)', r'\1 ', text)
+            # Убираем двойные пробелы
+            text = re.sub(r'\s+', ' ', text).strip()
             
             # Добавляем субтитр в SRT формате
             srt_content += f"{sub_index}\n"
@@ -249,6 +270,13 @@ def generate_srt_from_whisper(
         f.write(srt_content)
     
     print(f'SRT file saved to {srt_path}')
+    
+    # Применяем цензуру если были переданы слова для цензурирования
+    if censor_words:
+        print(f'Applying censorship to subtitles...')
+        censor_srt_file(srt_path, censor_words, replacement='*')
+        print(f'Censorship applied to {srt_path}')
+    
     return srt_path
 
 
@@ -509,6 +537,9 @@ def _transcribe_with_external_whisper_subprocess(
         start_s = _parse_srt_time(start_raw)
         end_s = _parse_srt_time(end_raw)
         text = ' '.join(line.strip() for line in lines[2:] if line.strip())
+        # Очищаем текст от лишних пробелов и прижимаем пунктуацию
+        text = " ".join(text.split())
+        text = re.sub(r'\s+([,.!?])', r'\1', text)
         if not text:
             continue
         segments.append({
@@ -657,11 +688,16 @@ def clean_subtitle_text(text: str) -> str:
     Returns:
         Очищенный текст субтитра
     """
-    # Убираем лишние пробелы
+    # Убираем пробелы в начале и конце
+    text = text.strip()
+    
+    # Убираем лишние пробелы (схлопываем двойные пробелы)
     text = ' '.join(text.split())
     
+    # Прижимаем знаки препинания к словам (убираем пробел перед ними)
+    text = re.sub(r'\s+([,.!?])', r'\1', text)
+    
     # Убираем повторяющуюся пунктуацию
-    import re
     text = re.sub(r'([.!?])\1+', r'\1', text)
     
     # Капитализируем первую букву
@@ -706,6 +742,9 @@ def split_long_subtitles(srt_path: str, max_chars: int = 80) -> str:
                 
                 # Разбиваем длинный текст
                 subtitle_text = subtitle_text.strip()
+                # Очищаем текст от лишних пробелов и прижимаем пунктуацию
+                subtitle_text = " ".join(subtitle_text.split())
+                subtitle_text = re.sub(r'\s+([,.!?])', r'\1', subtitle_text)
                 if len(subtitle_text) > max_chars:
                     words = subtitle_text.split()
                     current_line = ''
@@ -810,3 +849,292 @@ def merge_subtitle_files(srt_files: list, output_path: str) -> str:
         f.write(merged_content.strip())
     
     return output_path
+
+
+# ==============================================
+# WORD CENSORSHIP AND METADATA CLEANUP FUNCTIONS
+# ==============================================
+
+def censor_words_in_text(text: str, words_to_censor: List[str], replacement: str = '*') -> str:
+    """
+    Цензурирует слова в тексте на основе черного списка.
+    Поддерживает цензурирование слов со всеми их склонениями.
+    Поддерживает как полное удаление, так и замену на символы.
+    
+    Args:
+        text: Исходный текст для цензурирования
+        words_to_censor: Список слов, которые нужно цензурировать
+        replacement: Строка для замены (по умолчанию '*' для каждого символа слова)
+                     Если пусто (''), слово полностью удаляется
+        
+    Returns:
+        Текст с цензурированными словами
+        
+    Example:
+        >>> censor_words_in_text("hello world", ["hello"], "*")
+        "**** world"
+        
+        >>> censor_words_in_text("hellos", ["hello"], "*")
+        "******" (со склонением)
+        
+        >>> censor_words_in_text("hello world", ["hello"], "")
+        "world"
+    """
+    import re
+    
+    print(f"[DEBUG] censor_words_in_text() called with censor list size: {len(words_to_censor)}")
+    
+    if not words_to_censor:
+        return text
+    
+    result = text
+    
+    for word in words_to_censor:
+        if not word.strip():
+            continue
+            
+        # Создаем паттерн для поиска слова и его склонений (case-insensitive)
+        # \b + слово + любые буквы/цифры (склонения) + \b
+        pattern = r'\b' + re.escape(word) + r'\w*\b'
+        
+        # Определяем функцию замены
+        def replacer(match):
+            found_word = match.group(0)
+            
+            if replacement:
+                word_len = len(found_word)
+                
+                # Определяем количество букв для замены в зависимости от длины слова
+                if word_len <= 3:
+                    num_to_replace = 1
+                elif word_len <= 6:
+                    num_to_replace = 2
+                else:
+                    num_to_replace = 3
+                
+                # Убедимся, что не пытаемся заменить больше букв, чем есть
+                num_to_replace = min(num_to_replace, word_len)
+                
+                # Выбираем случайные уникальные индексы для замены
+                indices_to_replace = set(random.sample(range(word_len), num_to_replace))
+                
+                # Строим новое слово с замененными буквами на *
+                result_chars = []
+                for i, char in enumerate(found_word):
+                    if i in indices_to_replace:
+                        result_chars.append('*')
+                    else:
+                        result_chars.append(char)
+                
+                return ''.join(result_chars)
+            else:
+                # Удаляем слово полностью
+                return ''
+        
+        # Заменяем со сменой регистра
+        result = re.sub(pattern, replacer, result, flags=re.IGNORECASE)
+        
+        # Убираем двойные пробелы после удаления слов
+        if not replacement:
+            result = re.sub(r'\s+', ' ', result).strip()
+    
+    return result
+
+
+def censor_srt_file(srt_path: str, words_to_censor: List[str], output_path: Optional[str] = None, 
+                    replacement: str = '*') -> str:
+    """
+    Применяет цензурирование к SRT файлу и сохраняет результат.
+    
+    Args:
+        srt_path: Путь к исходному SRT файлу
+        words_to_censor: Список слов для цензурирования
+        output_path: Путь для сохранения (если None, перезаписывает исходный файл)
+        replacement: Символ/строка для замены
+        
+    Returns:
+        Путь к цензурированному SRT файлу
+    """
+    if not os.path.exists(srt_path):
+        raise FileNotFoundError(f'SRT файл не найден: {srt_path}')
+    
+    if output_path is None:
+        output_path = srt_path
+    
+    # Читаем SRT файл
+    with open(srt_path, 'r', encoding='utf-8') as f:
+        content = f.read()
+    
+    # Обрабатываем блоки субтитров
+    blocks = content.strip().split('\n\n')
+    censored_blocks = []
+    
+    for block in blocks:
+        lines = block.split('\n')
+        if len(lines) < 3 or '-->' not in lines[1]:
+            censored_blocks.append(block)
+            continue
+        
+        # Сохраняем номер субтитра и тайминг
+        subtitle_num = lines[0]
+        timing = lines[1]
+        
+        # Цензурируем текст субтитра (остальные строки после тайминга)
+        subtitle_text = '\n'.join(lines[2:])
+        censored_text = censor_words_in_text(subtitle_text, words_to_censor, replacement)
+        
+        # Собираем цензурированный блок
+        if censored_text.strip():  # Пропускаем пустые субтитры
+            censored_block = f'{subtitle_num}\n{timing}\n{censored_text}'
+            censored_blocks.append(censored_block)
+    
+    # Сохраняем результат
+    with open(output_path, 'w', encoding='utf-8') as f:
+        f.write('\n\n'.join(censored_blocks))
+    
+    return output_path
+
+
+def load_censor_list_from_file(file_path: str) -> List[str]:
+    """
+    Загружает черный список слов из файла.
+    Поддерживает форматы: каждое слово на новой строке, слова через запятую, слова через пробел.
+    
+    Args:
+        file_path: Путь к файлу со списком слов
+        
+    Returns:
+        Список слов для цензурирования
+    """
+    if not os.path.exists(file_path):
+        return []
+    
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+    except Exception as e:
+        print(f'Ошибка при чтении файла черного списка: {e}')
+        return []
+    
+    # Обработка разных форматов
+    words = []
+    
+    # Если содержит запятые, разделяем по запятым
+    if ',' in content:
+        words = [w.strip() for w in content.split(',') if w.strip()]
+    # Если содержит переносы строк
+    elif '\n' in content:
+        words = [w.strip() for w in content.split('\n') if w.strip()]
+    # Иначе разделяем по пробелам
+    else:
+        words = [w.strip() for w in content.split() if w.strip()]
+    
+    return words
+
+
+def clean_metadata(title: str, description: str, tags: str, 
+                   words_to_censor: Optional[List[str]] = None) -> Dict[str, str]:
+    """
+    Очищает метаданные видео (название, описание, теги) и применяет цензуру.
+    
+    Args:
+        title: Название видео
+        description: Описание видео
+        tags: Теги (строка через запятую или пространство)
+        words_to_censor: Список слов для цензурирования (опционально)
+        
+    Returns:
+        Словарь с очищенными метаданными:
+            - 'title': Очищенное название (макс 100 символов для YouTube)
+            - 'description': Очищенное описание (макс 5000 символов)
+            - 'tags': Очищенные теги (список)
+    """
+    if words_to_censor is None:
+        words_to_censor = []
+    
+    # Очищаем название
+    cleaned_title = title.strip()
+    # Убираем лишние пробелы
+    cleaned_title = ' '.join(cleaned_title.split())
+    # Прижимаем знаки препинания к словам
+    cleaned_title = re.sub(r'\s+([,.!?])', r'\1', cleaned_title)
+    # Убираем нежелательные символы в начале/конце (кроме букв, цифр, пробела и основной пунктуации)
+    cleaned_title = cleaned_title.strip(' \t\n\r')
+    # Ограничиваем длину (YouTube лимит - 100 символов)
+    if len(cleaned_title) > 100:
+        cleaned_title = cleaned_title[:97] + '...'
+    
+    # Применяем цензуру к названию
+    if words_to_censor:
+        cleaned_title = censor_words_in_text(cleaned_title, words_to_censor, '*')
+    
+    # Очищаем описание
+    cleaned_description = description.strip()
+    # Убираем лишние пробелы
+    cleaned_description = ' '.join(cleaned_description.split())
+    # Прижимаем знаки препинания к словам
+    cleaned_description = re.sub(r'\s+([,.!?])', r'\1', cleaned_description)
+    # Убираем множественные переносы строк (оставляем максимум 2 переноса подряд)
+    cleaned_description = re.sub(r'\n\s*\n\s*\n+', '\n\n', cleaned_description)
+    # Ограничиваем длину (YouTube лимит - 5000 символов)
+    if len(cleaned_description) > 5000:
+        cleaned_description = cleaned_description[:4997] + '...'
+    
+    # Применяем цензуру к описанию
+    if words_to_censor:
+        cleaned_description = censor_words_in_text(cleaned_description, words_to_censor, '*')
+    
+    # Очищаем теги
+    # Разделяем теги (поддерживаем и запятую, и пробел)
+    if ',' in tags:
+        tag_list = [t.strip() for t in tags.split(',') if t.strip()]
+    else:
+        tag_list = [t.strip() for t in tags.split() if t.strip()]
+    
+    # Убираем дубликаты (но сохраняем порядок)
+    seen = set()
+    cleaned_tags = []
+    for tag in tag_list:
+        tag_lower = tag.lower()
+        if tag_lower not in seen:
+            # Применяем цензуру к тегу
+            if words_to_censor:
+                tag = censor_words_in_text(tag, words_to_censor, '*')
+            
+            cleaned_tags.append(tag)
+            seen.add(tag_lower)
+    
+    # Ограничиваем количество тегов (YouTube рекомендует 5-15)
+    # и длину каждого тега (макс 30 символов)
+    final_tags = []
+    for tag in cleaned_tags[:500]:  # YouTube допускает до 500 тегов
+        if len(tag) > 30:
+            tag = tag[:30]
+        if tag:
+            final_tags.append(tag)
+    
+    return {
+        'title': cleaned_title,
+        'description': cleaned_description,
+        'tags': final_tags
+    }
+
+
+def clean_metadata_dict(metadata: Dict[str, str], 
+                        words_to_censor: Optional[List[str]] = None) -> Dict[str, str]:
+    """
+    Очищает метаданные из словаря (удобная функция для использования с AI воркером).
+    
+    Args:
+        metadata: Словарь с ключами 'title', 'description', 'tags'
+        words_to_censor: Список слов для цензурирования
+        
+    Returns:
+        Очищенный словарь метаданных
+    """
+    return clean_metadata(
+        title=metadata.get('title', ''),
+        description=metadata.get('description', ''),
+        tags=metadata.get('tags', ''),
+        words_to_censor=words_to_censor
+    )
