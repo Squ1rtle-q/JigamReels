@@ -308,9 +308,9 @@ class Worker(QThread):
                                         output_path=tmp_anim_out,
                                         words=words_timestamps,
                                         fontfile='TheBoldFont.ttf',
-                                        base_font_size=70,
-                                        zoom_font_size=90,
-                                        y_offset=200
+                                        base_font_size=self.subtitle_settings.get('word_anim_base_size', 60),
+                                        zoom_font_size=self.subtitle_settings.get('word_anim_zoom_size', 80),
+                                        y_offset=self.subtitle_settings.get('word_anim_vertical_offset', 200)
                                     )
                                     if os.path.exists(tmp_anim_out):
                                         os.remove(current_out_file_path)

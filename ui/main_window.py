@@ -762,7 +762,7 @@ class ProcessingWidgetContent(QWidget):
         
         self.subs_off_radio = QRadioButton('Выключены')
         self.subs_from_file_radio = QRadioButton('Из файла SRT')
-        self.subs_generate_radio = QRadioButton('Сгенерировать (Whisper)')
+        self.subs_generate_radio = QRadioButton('Анимированные слова (Whisper)')
         self.subs_off_radio.setChecked(True)
         
         self.subs_mode_group.addButton(self.subs_off_radio)
@@ -825,7 +825,33 @@ class ProcessingWidgetContent(QWidget):
         whisper_row3.addWidget(self.subs_words_spin)
         whisper_row3.addStretch()
         subs_whisper_layout.addLayout(whisper_row3)
-        
+
+        # Настройки анимации одного слова
+        whisper_row4 = QHBoxLayout()
+        whisper_row4.addWidget(QLabel('Base Font Size:'))
+        self.subs_word_anim_base_size_spin = QSpinBox()
+        self.subs_word_anim_base_size_spin.setRange(10, 200)
+        self.subs_word_anim_base_size_spin.setValue(60)
+        whisper_row4.addWidget(self.subs_word_anim_base_size_spin)
+        whisper_row4.addSpacing(20)
+
+        whisper_row4.addWidget(QLabel('Zoom Font Size:'))
+        self.subs_word_anim_zoom_size_spin = QSpinBox()
+        self.subs_word_anim_zoom_size_spin.setRange(10, 300)
+        self.subs_word_anim_zoom_size_spin.setValue(80)
+        whisper_row4.addWidget(self.subs_word_anim_zoom_size_spin)
+        whisper_row4.addStretch()
+        subs_whisper_layout.addLayout(whisper_row4)
+
+        whisper_row5 = QHBoxLayout()
+        whisper_row5.addWidget(QLabel('Vertical Offset:'))
+        self.subs_word_anim_offset_spin = QSpinBox()
+        self.subs_word_anim_offset_spin.setRange(-300, 300)
+        self.subs_word_anim_offset_spin.setValue(200)
+        whisper_row5.addWidget(self.subs_word_anim_offset_spin)
+        whisper_row5.addStretch()
+        subs_whisper_layout.addLayout(whisper_row5)
+
         subs_main_layout.addWidget(self.subs_whisper_widget)
         
         # Общие настройки стиля
@@ -1964,6 +1990,9 @@ class ProcessingWidgetContent(QWidget):
             'subtitle_model': self.subs_model_combo.currentText(),
             'subtitle_language': self.subs_lang_combo.currentText(),
             'subtitle_words_per_line': self.subs_words_spin.value(),
+            'subtitle_word_anim_base_size': self.subs_word_anim_base_size_spin.value(),
+            'subtitle_word_anim_zoom_size': self.subs_word_anim_zoom_size_spin.value(),
+            'subtitle_word_anim_vertical_offset': self.subs_word_anim_offset_spin.value(),
             'subtitle_font': self.subs_font_combo.currentText().strip(),
             'subtitle_font_style': self.subs_font_style_combo.currentText(),
             'subtitle_font_size': self.subs_size_spin.value(),
@@ -2078,6 +2107,9 @@ class ProcessingWidgetContent(QWidget):
         if self.subs_lang_combo.findText(lang) >= 0:
             self.subs_lang_combo.setCurrentText(lang)
         self.subs_words_spin.setValue(int(preset.get('subtitle_words_per_line', 2)))
+        self.subs_word_anim_base_size_spin.setValue(int(preset.get('subtitle_word_anim_base_size', 60)))
+        self.subs_word_anim_zoom_size_spin.setValue(int(preset.get('subtitle_word_anim_zoom_size', 80)))
+        self.subs_word_anim_offset_spin.setValue(int(preset.get('subtitle_word_anim_vertical_offset', 200)))
 
         font_name = preset.get('subtitle_font', self.subs_font_combo.currentText())
         if self.subs_font_combo.findText(font_name) >= 0:
@@ -2197,6 +2229,9 @@ class ProcessingWidgetContent(QWidget):
             subtitle_settings['model'] = self.subs_model_combo.currentText()
             subtitle_settings['language'] = self.subs_lang_combo.currentText()
             subtitle_settings['words_per_line'] = self.subs_words_spin.value()
+            subtitle_settings['word_anim_base_size'] = self.subs_word_anim_base_size_spin.value()
+            subtitle_settings['word_anim_zoom_size'] = self.subs_word_anim_zoom_size_spin.value()
+            subtitle_settings['word_anim_vertical_offset'] = self.subs_word_anim_offset_spin.value()
         
         _al_raw = self.subs_position_combo.currentData()
         try:
