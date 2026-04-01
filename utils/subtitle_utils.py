@@ -150,7 +150,8 @@ def generate_srt_from_whisper(
     model_name: str,
     language: str,
     words_per_line: int,
-    censor_words: Optional[List[str]] = None
+    censor_words: Optional[List[str]] = None,
+    _retry_with_openai: bool = False
 ) -> str:
     """
     Генерирует SRT файл субтитров из аудиофайла используя Whisper AI.
@@ -179,7 +180,7 @@ def generate_srt_from_whisper(
     else:
         lang_code = None
 
-    print(f"Loading transcription model '{model_name}'...")
+    print(f"Loading transcription model '{model_name}' (language={language}, code={lang_code})...")
 
     # Сначала пытаемся использовать faster-whisper (качественнее/стабильнее таймкоды),
     # затем fallback на openai-whisper.
@@ -188,6 +189,23 @@ def generate_srt_from_whisper(
         model_name=model_name,
         language_code=lang_code
     )
+
+    def contains_cyrillic(text: str) -> bool:
+        return bool(re.search(r'[а-яА-Я]', text))
+
+    if lang_code == 'ru' and not _retry_with_openai:
+        total_text = ' '.join((seg.get('text') or '') for seg in normalized_segments)
+        if total_text and not contains_cyrillic(total_text):
+            print('Warning: requested Russian transcription, but result has no Cyrillic characters. Retrying via openai-whisper...')
+            try:
+                normalized_segments = _transcribe_with_openai_whisper(audio_path, model_name, lang_code)
+                total_text2 = ' '.join((seg.get('text') or '') for seg in normalized_segments)
+                if total_text2 and contains_cyrillic(total_text2):
+                    print('openai-whisper returned Cyrillic text as expected.')
+                else:
+                    print('openai-whisper did not return Cyrillic text either; using initial result.')
+            except Exception as e:
+                print(f'Warning: openai-whisper retry failed: {e}. Using initial transcription.')
 
     print('Transcription finished. Generating SRT file...')
 
@@ -270,77 +288,6 @@ def generate_srt_from_whisper(
         print(f'Censorship applied to {srt_path}')
     
     return srt_path
-
-
-def generate_word_timestamps_from_whisper(
-    audio_path: str,
-    model_name: str,
-    language: str,
-    censor_words: Optional[List[str]] = None
-) -> List[Dict]:
-    """
-    Генерирует список слов с таймкодами из Whisper.
-    Возвращает [{'word': str, 'start': float, 'end': float}, ...].
-    """
-    censor_words = censor_words or []
-    if language != 'Auto-detect':
-        language_code = LANGUAGE_NAME_TO_CODE.get(language.lower(), language.lower())
-    else:
-        language_code = None
-
-    normalized_segments = _transcribe_with_best_available_backend(
-        audio_path=audio_path,
-        model_name=model_name,
-        language_code=language_code
-    )
-
-    words = []
-    for seg in normalized_segments:
-        seg_start = float(seg.get('start', 0.0))
-        seg_end = float(seg.get('end', seg_start + 0.0))
-        word_list = seg.get('words', []) or []
-
-        if word_list:
-            for w in word_list:
-                raw_word = str(w.get('word', '')).strip()
-                if not raw_word:
-                    continue
-                cleaned = clean_subtitle_text(raw_word)
-                if censor_words:
-                    cleaned = censor_words_in_text(cleaned, censor_words, '*')
-                if not cleaned:
-                    continue
-
-                start = float(w.get('start', 0.0))
-                end = float(w.get('end', start + 0.0))
-                if end <= start:
-                    continue
-                words.append({'word': cleaned, 'start': start, 'end': end})
-        else:
-            text = str(seg.get('text', '')).strip()
-            if not text:
-                continue
-            text = clean_subtitle_text(text)
-            if censor_words:
-                text = censor_words_in_text(text, censor_words, '*')
-            split_words = [w for w in text.split() if w.strip()]
-            if not split_words:
-                continue
-
-            segment_duration = max(0.01, seg_end - seg_start)
-            chunk = segment_duration / len(split_words)
-            for idx, raw_word in enumerate(split_words):
-                cleaned = clean_subtitle_text(raw_word)
-                if censor_words:
-                    cleaned = censor_words_in_text(cleaned, censor_words, '*')
-                if not cleaned:
-                    continue
-                start = seg_start + idx * chunk
-                end = min(seg_end, start + chunk)
-                if end > start:
-                    words.append({'word': cleaned, 'start': start, 'end': end})
-
-    return words
 
 
 def _transcribe_with_best_available_backend(

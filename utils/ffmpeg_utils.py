@@ -132,19 +132,40 @@ def run_ffmpeg(cmd: List[str], input_file_for_log: str = "input",
         startupinfo.wShowWindow = subprocess.SW_HIDE
     
     # Построение финальной команды
+    def _normalize_ffmpeg_path(arg):
+        if not isinstance(arg, str):
+            return arg
+
+        # Не трогаем ключи параметров
+        if arg.startswith('-') and len(arg) > 1 and ' ' not in arg:
+            return arg
+
+        # Нормализуем разделители в путях, включая смешанные \ и /
+        if re.search(r'[\\/]', arg):
+            normalized = arg.replace('\\', '/').replace('//', '/')
+            # FFmpeg понимает как обычный путь (не URI), кроме явных file:
+            if normalized.startswith('file:'):
+                return normalized
+            return normalized
+
+        return arg
+
+    normalized_cmd = [_normalize_ffmpeg_path(a) for a in cmd]
+
     final_cmd = [FFMPEG_PATH_EFFECTIVE]
-    
+
     # Добавление параметров логирования если их нет
-    if '-loglevel' not in cmd:
+    if '-loglevel' not in normalized_cmd:
         final_cmd.extend(['-loglevel', 'debug'])
-    
+
     # Добавление прогресса если нужен
     if progress_callback:
         final_cmd.extend(['-progress', 'pipe:1'])
-    
+
     if '-hide_banner' not in cmd:
         final_cmd.append('-hide_banner')
-    
+
+    # Не превращаем системные Windows пути в 'file:' URI, FFmpeg лучше принимает обычные пути.
     final_cmd.extend(cmd)
     
     # Логирование команды
@@ -562,9 +583,14 @@ def remove_silence_from_video(
 def _escape_drawtext_text(raw_text: str) -> str:
     escaped = raw_text.replace('\\', '\\\\')
     escaped = escaped.replace(':', '\\:')
-    escaped = escaped.replace('\'', "\\'")
+    # Используем максимально безопасный вариант: удаляем апострофы из текста.
+    escaped = escaped.replace("'", "")
     escaped = escaped.replace('%', '%%')
     escaped = escaped.replace('\n', '\\n')
+
+    # Удаляем скобочные символы, чтобы исключить конфликт с метками фильтров.
+    escaped = escaped.replace('[', '').replace(']', '').replace('{', '').replace('}', '')
+
     return escaped
 
 
@@ -575,7 +601,8 @@ def render_one_word_animation(
     fontfile: str = 'TheBoldFont.ttf',
     base_font_size: int = 70,
     zoom_font_size: int = 90,
-    y_offset: int = 200
+    y_offset: int = 200,
+    fallback_attempt: bool = False
 ) -> str:
     """
     Рендерит анимацию субтитров «одно слово на экране» с эффектом zoom.
@@ -602,48 +629,63 @@ def render_one_word_animation(
 
     def build_filter_chain(words_list):
         chain = ''
-        prev = '[0:v]'
-        current_out_label = prev
+        last_used_label = '[0:v]'
+        current_out_label = last_used_label
+        valid_words = 0
 
         for item in words_list:
             if not item.get('word') or item.get('start') is None or item.get('end') is None:
                 continue
 
-            # определяем следующий корректный индекс из предыдущей выходной метки
-            if current_out_label.startswith('[v') and current_out_label.endswith(']'):
+            # текущая входная метка для drawtext
+            prev_label = current_out_label
+
+            if prev_label.startswith('[v') and prev_label.endswith(']'):
                 try:
-                    base_idx = int(current_out_label[2:-1])
+                    base_idx = int(prev_label[2:-1])
                 except ValueError:
                     base_idx = -1
             else:
                 base_idx = -1
 
-            next_idx = base_idx + 1
-            current_out_label = f"[v{next_idx}]"
+            candidate_label = f"[v{base_idx + 1}]"
 
             start = float(item['start'])
             end = float(item['end'])
-            word = _escape_drawtext_text(item['word'])
+            escaped_word = _escape_drawtext_text(item['word']).strip()
+            if not escaped_word:
+                # пропускаем некорректное/пустое слово и не увеличиваем метку
+                continue
+
+            current_out_label = candidate_label
+
             fontsize_expr = f"if(lt(t,{start + 0.1:.3f}),{base_font_size} + ({zoom_font_size} - {base_font_size})*(t-{start:.3f})/0.1,{zoom_font_size})"
             enable_expr = f"between(t,{start:.3f},{end:.3f})"
 
             drawtext = (
-                f"{prev}drawtext=fontfile='{fontfile}':text='{word}':x=(W-tw)/2:y=(H-th)/2+{y_offset}"
+                f"{prev_label}drawtext=fontfile='{fontfile}':text='{escaped_word}':x=(W-tw)/2:y=(H-th)/2+{y_offset}"
                 f":fontcolor=white:borderw=3:bordercolor=black:enable='{enable_expr}'"
                 f":fontsize={fontsize_expr}{current_out_label};"
             )
             chain += drawtext
-            prev = current_out_label
 
-        return chain, current_out_label
+            # обновление метки, которая действительно была создана
+            last_used_label = current_out_label
+            valid_words += 1
 
-    filter_complex, final_label = build_filter_chain(words)
+        # если не было успешного добавления drawtext, возвращаем начальную метку
+        return chain, last_used_label, valid_words
 
-    if final_label == '[0:v]':
+    filter_complex, final_label, used_words = build_filter_chain(words)
+
+    if final_label == '[0:v]' or used_words == 0:
         # Нечего рендерить в drawtext, просто копируем исходник
         logging.info('render_one_word_animation: слова отсутствуют, копирование input->output')
         shutil.copyfile(input_path, output_path)
         return output_path
+
+    # Явно создаем аудио-лейбл aout для 100% контроля на маппинг
+    filter_complex += ';[0:a]anull[aout]'
 
     if use_filter_script:
         with tempfile.NamedTemporaryFile('w', delete=False, suffix='.txt', encoding='utf-8') as ff:
@@ -654,7 +696,7 @@ def render_one_word_animation(
             '-i', input_path,
             '-filter_script', filter_script_path,
             '-map', final_label,
-            '-map', '0:a?',
+            '-map', '[aout]',
             '-c:v', 'libx264',
             '-preset', 'veryfast',
             '-crf', '23',
@@ -668,7 +710,7 @@ def render_one_word_animation(
             '-i', input_path,
             '-filter_complex', filter_complex,
             '-map', final_label,
-            '-map', '0:a?',
+            '-map', '[aout]',
             '-c:v', 'libx264',
             '-preset', 'veryfast',
             '-crf', '23',
@@ -677,7 +719,7 @@ def render_one_word_animation(
             output_path
         ]
 
-    print(f"DEBUG: Words count: {len(words)}, Final Label: {final_label}")
+    print(f"DEBUG: Words count: {len(words)}, Used words: {used_words}, Final Label: {final_label}")
     print(f"DEBUG: FFmpeg command: {ffmpeg_cmd}")
     logging.debug(f"render_one_word_animation: final map label {final_label}, total words {len(words)}")
     logging.debug(f"render_one_word_animation: ffmpeg_cmd = {ffmpeg_cmd}")
@@ -685,8 +727,56 @@ def render_one_word_animation(
     try:
         run_ffmpeg(ffmpeg_cmd, input_path)
     except Exception as ff_err:
-        print(f"WARNING: render_one_word_animation failed (fallback to copy): {ff_err}")
-        logging.warning(f"render_one_word_animation failed: {ff_err}")
+        detail = ''
+        if use_filter_script and os.path.exists(filter_script_path):
+            try:
+                with open(filter_script_path, 'r', encoding='utf-8', errors='replace') as f:
+                    content = f.read(500)
+                    detail = f"Filter script first 500 chars:\n{content}"
+            except Exception as e:
+                detail = f"Could not read filter script for debug: {e}"
+        else:
+            try:
+                detail = f"Filter chain first 500 chars:\n{filter_complex[:500]}"
+            except Exception as e:
+                detail = f"Could not read filter_complex for debug: {e}"
+
+        log_msg = (
+            f"render_one_word_animation failed: {ff_err}\n"
+            f"Final label: {final_label}\n"
+            f"{detail}"
+        )
+
+        print(f"WARNING: render_one_word_animation failed (fallback): {ff_err}")
+        logging.warning(log_msg)
+        if detail:
+            print(detail)
+
+        # Если первая попытка упала, делаем второй проход с упрощенными словами (удаляем апострофы).
+        if not fallback_attempt:
+            logging.info('Retrying render_one_word_animation with apostrophes removed')
+            cleaned_words = []
+            for item in words:
+                if not item.get('word') or item.get('start') is None or item.get('end') is None:
+                    cleaned_words.append(item)
+                    continue
+                cleaned_word = item['word'].replace("'", "")
+                cleaned_words.append({**item, 'word': cleaned_word})
+            try:
+                return render_one_word_animation(
+                    input_path,
+                    output_path,
+                    cleaned_words,
+                    fontfile,
+                    base_font_size,
+                    zoom_font_size,
+                    y_offset,
+                    fallback_attempt=True
+                )
+            except Exception as retry_err:
+                logging.warning(f"Fallback attempt failed too: {retry_err}")
+                print(f"WARNING: render_one_word_animation retry failed: {retry_err}")
+
         shutil.copyfile(input_path, output_path)
         return output_path
     finally:

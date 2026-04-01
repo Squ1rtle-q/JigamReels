@@ -1,69 +1,7 @@
-# Виртуальная среда Python
-.venv/
-venv/
-env/
-
-# Кэш Python
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
-
-# Конфигурационные файлы
-config/
-.env
-.env.local
-
-# Бинарные файлы и внешние утилиты (инструкция в bin/README.md — в репозитории)
-bin/*
-!bin/README.md
-ffmpeg/
-
-# Собранный exe — не коммитим (релизы выкладывайте в GitHub Releases)
-*.exe
-
-# Логи
-*.log
-
-# Аудиофайлы и субтитры
-*.wav
-*.srt
-*.ass
-
-# IDE и редакторы
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
-
-# Операционная система
-.DS_Store
-Thumbs.db
-
-# Документация и черновики (инструкции находятся в репозитории)
-instruction.md
-BUILD.md
-CENSOR_GUIDE.md
-CENSOR_QUICK_START.md
-UI_CENSOR_USAGE.md
-changelog.txt
-
-# Временные файлы
-*.tmp
-*.temp
-temp/
-tmp/
-output/
-вывод/
-нарезки/
-
-# Сборка и дистрибутив
-build/
-dist/
-*.egg-info/
-*.spec
-
-# Дополнительные файлы
-models/
-build.txt
+"__pycache__/" 
+"*.pyc" 
+"build/" 
+"dist/" 
+"*.dll" 
+"cudnn*.dll" 
+"nvblas*.dll" 

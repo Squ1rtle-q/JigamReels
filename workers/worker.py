@@ -18,9 +18,8 @@ from utils.ffmpeg_utils import (
     get_video_dimensions,
     reels_letterbox_vertical_inset_px,
     remove_silence_from_video,
-    render_one_word_animation,
 )
-from utils.subtitle_utils import extract_audio, generate_srt_from_whisper, generate_word_timestamps_from_whisper, build_segment_srt, censor_words_in_text
+from utils.subtitle_utils import extract_audio, generate_srt_from_whisper, build_segment_srt, censor_words_in_text
 from utils.ai_helper import generate_smart_title, sanitize_title_for_filename
 from utils.file_utils import safe_filename
 
@@ -230,6 +229,8 @@ class Worker(QThread):
                                 self.out_dir,
                                 f'{name_part}{suffix}{seg_suffix}_{file_unique}.mp4'
                             )
+                        # Приводим путь к нормальному формату и убираем смешанные слэши
+                        current_out_file_path = os.path.normpath(current_out_file_path)
 
                         # Этап 1: обрабатываем/режем БЕЗ субтитров.
                         process_single(
@@ -275,8 +276,14 @@ class Worker(QThread):
                                 padding=0.1
                             )
                             if os.path.exists(trimmed_clip):
-                                os.remove(current_out_file_path)
-                                os.replace(trimmed_clip, current_out_file_path)
+                                # Перемещение файла возможное между дисками C: и D:
+                                try:
+                                    shutil.move(trimmed_clip, current_out_file_path)
+                                except Exception:
+                                    # fallback на replace, если тот же диск
+                                    if os.path.exists(current_out_file_path):
+                                        os.remove(current_out_file_path)
+                                    os.replace(trimmed_clip, current_out_file_path)
                                 self.status_update.emit('Тишина удалена. Продолжаем обработку.')
                         except Exception as silence_err:
                             logging.warning(f'Не удалось выполнить удаление тишины: {silence_err}')
@@ -285,48 +292,22 @@ class Worker(QThread):
                         effective_srt_path = None
                         if subtitle_mode == 'whisper':
                             seg_audio_path = os.path.join(tempfile.gettempdir(), f'{uuid.uuid4()}.wav')
+                            seg_srt_path = os.path.join(tempfile.gettempdir(), f'{uuid.uuid4()}.srt')
                             self.status_update.emit(
                                 f'Распознавание речи для готового клипа {seg_i}/{len(segment_specs)}...'
                             )
                             extract_audio(current_out_file_path, seg_audio_path)
-
-                            words_timestamps = generate_word_timestamps_from_whisper(
+                            generate_srt_from_whisper(
                                 audio_path=seg_audio_path,
+                                srt_path=seg_srt_path,
                                 model_name=self.subtitle_settings.get('model'),
                                 language=self.subtitle_settings.get('language'),
+                                words_per_line=self.subtitle_settings.get('words_per_line'),
                                 censor_words=self.censor_words if self.censor_words else None
                             )
-
                             temp_audio_paths.append(seg_audio_path)
-
-                            if words_timestamps:
-                                self.status_update.emit('Рендер анимации "одно слово" через drawtext...')
-                                try:
-                                    tmp_anim_out = os.path.join(tempfile.gettempdir(), f'{uuid.uuid4()}_wordanim.mp4')
-                                    render_one_word_animation(
-                                        input_path=current_out_file_path,
-                                        output_path=tmp_anim_out,
-                                        words=words_timestamps,
-                                        fontfile='TheBoldFont.ttf',
-                                        base_font_size=self.subtitle_settings.get('word_anim_base_size', 60),
-                                        zoom_font_size=self.subtitle_settings.get('word_anim_zoom_size', 80),
-                                        y_offset=self.subtitle_settings.get('word_anim_vertical_offset', 200)
-                                    )
-                                    if os.path.exists(tmp_anim_out):
-                                        os.remove(current_out_file_path)
-                                        os.replace(tmp_anim_out, current_out_file_path)
-                                        self.status_update.emit('Анимация слов на экране готова.')
-                                except Exception as animate_err:
-                                    logging.warning(f'Не удалось выполнить анимацию слов: {animate_err}')
-
-                                # Собираем текст для генерации названия
-                                filtered_text = ' '.join([w['word'] for w in words_timestamps if w.get('word')])
-                                if filtered_text:
-                                    full_transcription_text.append(filtered_text)
-
-                            else:
-                                self.status_update.emit('Whisper не вернул слова для анимации.')
-
+                            segment_srt_paths.append(seg_srt_path)
+                            effective_srt_path = seg_srt_path
                         elif subtitle_mode == 'srt_file':
                             effective_srt_path = srt_path
                             if seg_start is not None and seg_duration is not None:
@@ -339,18 +320,16 @@ class Worker(QThread):
                                 )
                                 segment_srt_paths.append(seg_srt_path)
 
-                        # Если для whisper мы рендерим один-слово анимацию, выше это уже выполнено.
-                        # Для srt_file делаем старый механизм вшивки субтитров.
-                        if subtitle_mode == 'srt_file' and effective_srt_path and os.path.exists(effective_srt_path) and os.path.getsize(effective_srt_path) > 0:
-                            subtitle_style_for_burn = dict(self.subtitle_settings.get('style') or {})
-                            if self.output_format == REELS_FORMAT_NAME:
-                                sw, sh = get_video_dimensions(in_file_path)
-                                lb_inset = reels_letterbox_vertical_inset_px(
-                                    sw, sh, crop_filter, current_zoom
-                                )
-                                if lb_inset > 0:
-                                    subtitle_style_for_burn['reels_letterbox_inset'] = lb_inset
+                        subtitle_style_for_burn = dict(self.subtitle_settings.get('style') or {})
+                        if self.output_format == REELS_FORMAT_NAME:
+                            sw, sh = get_video_dimensions(in_file_path)
+                            lb_inset = reels_letterbox_vertical_inset_px(
+                                sw, sh, crop_filter, current_zoom
+                            )
+                            if lb_inset > 0:
+                                subtitle_style_for_burn['reels_letterbox_inset'] = lb_inset
 
+                        if effective_srt_path and os.path.exists(effective_srt_path) and os.path.getsize(effective_srt_path) > 0:
                             try:
                                 tmp_sub_out = os.path.join(self.out_dir, f'{uuid.uuid4()}_subpass.mp4')
                                 burn_subtitles_postprocess(
@@ -391,11 +370,11 @@ class Worker(QThread):
                                     except Exception:
                                         pass
                                     logging.exception('Postprocess subtitle burn failed (plain)')
-                        elif subtitle_mode not in ['none', 'whisper']:
+                        elif subtitle_mode != 'none':
                             self.status_update.emit('Субтитры пустые/некорректные, вшивание пропущено.')
                         
                         # Собираем текст из субтитров для автоматического названия видео
-                        if subtitle_mode == 'srt_file' and effective_srt_path and os.path.exists(effective_srt_path):
+                        if effective_srt_path and os.path.exists(effective_srt_path):
                             try:
                                 srt_text = self._extract_text_from_srt(effective_srt_path)
                                 if srt_text:
@@ -408,42 +387,46 @@ class Worker(QThread):
                     # Генерируем умное название на основе полной транскрипции
                     if full_transcription_text and self.output_paths:
                         try:
-                            # Полный отказ от g4f: используем локальный fallback по имени файла + дата-время.
-                            now_label = datetime.now().strftime('%Y%m%d_%H%M%S')
-                            smart_title = f"{name_part}_{now_label}"
+                            combined_text = ' '.join(full_transcription_text)
+                            if combined_text.strip():
+                                self.status_update.emit('Генерируем название видео через ИИ...')
+                                smart_title = generate_smart_title(combined_text)
+                                
+                                # Проверяем, что название успешно сгенерировано (не None и не "Video")
+                                if smart_title and smart_title.lower() != 'video':
+                                    # Применяем цензуру к названию
+                                    if self.censor_words:
+                                        smart_title = censor_words_in_text(smart_title, self.censor_words, '*')
+                                    
+                                    # Очищаем название для использования в имени файла
+                                    clean_title = sanitize_title_for_filename(smart_title)
+                                    clean_title = safe_filename(clean_title)
+                                    
+                                    # Переименовываем все выходные файлы (если несколько сегментов/файлов)
+                                    if self.output_paths:
+                                        time_part = file_unique.split('_')[1][:5] if '_' in file_unique else '00-00'
 
-                            if self.censor_words:
-                                smart_title = censor_words_in_text(smart_title, self.censor_words, '*')
+                                        for idx, original_output_path in enumerate(list(self.output_paths)):
+                                            original_dir = os.path.dirname(original_output_path)
+                                            _, ext = os.path.splitext(original_output_path)
+                                            ext = ext.strip()  # Убираем случайные пробелы
 
-                            clean_title = sanitize_title_for_filename(smart_title)
-                            clean_title = safe_filename(clean_title)
+                                            if len(self.output_paths) == 1:
+                                                base_new_name = f'{clean_title} ({time_part}){ext}'
+                                            else:
+                                                base_new_name = f'{clean_title} ({time_part})_{idx + 1}{ext}'
 
-                            # Переименовываем основной файл (первый или единственный)
-                            if self.output_paths:
-                                original_output_path = self.output_paths[0]
-                                original_dir = os.path.dirname(original_output_path)
-                                _, ext = os.path.splitext(original_output_path)
-                                ext = ext.strip()  # Убираем случайные пробелы
+                                            base_new_name = ' '.join(base_new_name.split())
+                                            new_output_path = os.path.join(original_dir, base_new_name)
 
-                                # Извлекаем только время (часы-минуты) из file_unique
-                                # file_unique формат: 2025-02-26_18-45-30_abc12345
-                                time_part = file_unique.split('_')[1][:5] if '_' in file_unique else '00-00'
-
-                                # Формируем новое имя через пробелы (без лишних replace)
-                                # clean_title уже содержит пробелы, нужно просто их сохранить
-                                base_new_name = f'{clean_title} ({time_part}){ext}'
-                                # Убираем множественные пробелы если они появились
-                                base_new_name = ' '.join(base_new_name.split())
-                                new_output_path = os.path.join(original_dir, base_new_name)
-
-                                try:
-                                    if os.path.exists(original_output_path):
-                                        os.replace(original_output_path, new_output_path)
-                                        self.output_paths[0] = new_output_path
-                                        self.status_update.emit(f'Файл переименован: {clean_title}')
-                                        logging.info(f'Видео переименовано на: {base_new_name}')
-                                except Exception as rename_err:
-                                    logging.warning(f'Не удалось переименовать файл: {rename_err}')
+                                            try:
+                                                if os.path.exists(original_output_path):
+                                                    os.replace(original_output_path, new_output_path)
+                                                    self.output_paths[idx] = new_output_path
+                                                    self.status_update.emit(f'Файл переименован: {clean_title}')
+                                                    logging.info(f'Видео переименовано на: {base_new_name}')
+                                            except Exception as rename_err:
+                                                logging.warning(f'Не удалось переименовать файл: {rename_err}')
                         except Exception as title_err:
                             logging.warning(f'Ошибка при генерации названия: {title_err}')
                     
