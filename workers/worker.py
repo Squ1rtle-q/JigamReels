@@ -18,8 +18,9 @@ from utils.ffmpeg_utils import (
     get_video_dimensions,
     reels_letterbox_vertical_inset_px,
     remove_silence_from_video,
+    render_one_word_animation,
 )
-from utils.subtitle_utils import extract_audio, generate_srt_from_whisper, build_segment_srt, censor_words_in_text
+from utils.subtitle_utils import extract_audio, generate_srt_from_whisper, generate_word_timestamps_from_whisper, build_segment_srt, censor_words_in_text
 from utils.ai_helper import generate_smart_title, sanitize_title_for_filename
 from utils.file_utils import safe_filename
 
@@ -284,22 +285,48 @@ class Worker(QThread):
                         effective_srt_path = None
                         if subtitle_mode == 'whisper':
                             seg_audio_path = os.path.join(tempfile.gettempdir(), f'{uuid.uuid4()}.wav')
-                            seg_srt_path = os.path.join(tempfile.gettempdir(), f'{uuid.uuid4()}.srt')
                             self.status_update.emit(
                                 f'Распознавание речи для готового клипа {seg_i}/{len(segment_specs)}...'
                             )
                             extract_audio(current_out_file_path, seg_audio_path)
-                            generate_srt_from_whisper(
+
+                            words_timestamps = generate_word_timestamps_from_whisper(
                                 audio_path=seg_audio_path,
-                                srt_path=seg_srt_path,
                                 model_name=self.subtitle_settings.get('model'),
                                 language=self.subtitle_settings.get('language'),
-                                words_per_line=self.subtitle_settings.get('words_per_line'),
                                 censor_words=self.censor_words if self.censor_words else None
                             )
+
                             temp_audio_paths.append(seg_audio_path)
-                            segment_srt_paths.append(seg_srt_path)
-                            effective_srt_path = seg_srt_path
+
+                            if words_timestamps:
+                                self.status_update.emit('Рендер анимации "одно слово" через drawtext...')
+                                try:
+                                    tmp_anim_out = os.path.join(tempfile.gettempdir(), f'{uuid.uuid4()}_wordanim.mp4')
+                                    render_one_word_animation(
+                                        input_path=current_out_file_path,
+                                        output_path=tmp_anim_out,
+                                        words=words_timestamps,
+                                        fontfile='TheBoldFont.ttf',
+                                        base_font_size=70,
+                                        zoom_font_size=90,
+                                        y_offset=200
+                                    )
+                                    if os.path.exists(tmp_anim_out):
+                                        os.remove(current_out_file_path)
+                                        os.replace(tmp_anim_out, current_out_file_path)
+                                        self.status_update.emit('Анимация слов на экране готова.')
+                                except Exception as animate_err:
+                                    logging.warning(f'Не удалось выполнить анимацию слов: {animate_err}')
+
+                                # Собираем текст для генерации названия
+                                filtered_text = ' '.join([w['word'] for w in words_timestamps if w.get('word')])
+                                if filtered_text:
+                                    full_transcription_text.append(filtered_text)
+
+                            else:
+                                self.status_update.emit('Whisper не вернул слова для анимации.')
+
                         elif subtitle_mode == 'srt_file':
                             effective_srt_path = srt_path
                             if seg_start is not None and seg_duration is not None:
@@ -312,16 +339,18 @@ class Worker(QThread):
                                 )
                                 segment_srt_paths.append(seg_srt_path)
 
-                        subtitle_style_for_burn = dict(self.subtitle_settings.get('style') or {})
-                        if self.output_format == REELS_FORMAT_NAME:
-                            sw, sh = get_video_dimensions(in_file_path)
-                            lb_inset = reels_letterbox_vertical_inset_px(
-                                sw, sh, crop_filter, current_zoom
-                            )
-                            if lb_inset > 0:
-                                subtitle_style_for_burn['reels_letterbox_inset'] = lb_inset
+                        # Если для whisper мы рендерим один-слово анимацию, выше это уже выполнено.
+                        # Для srt_file делаем старый механизм вшивки субтитров.
+                        if subtitle_mode == 'srt_file' and effective_srt_path and os.path.exists(effective_srt_path) and os.path.getsize(effective_srt_path) > 0:
+                            subtitle_style_for_burn = dict(self.subtitle_settings.get('style') or {})
+                            if self.output_format == REELS_FORMAT_NAME:
+                                sw, sh = get_video_dimensions(in_file_path)
+                                lb_inset = reels_letterbox_vertical_inset_px(
+                                    sw, sh, crop_filter, current_zoom
+                                )
+                                if lb_inset > 0:
+                                    subtitle_style_for_burn['reels_letterbox_inset'] = lb_inset
 
-                        if effective_srt_path and os.path.exists(effective_srt_path) and os.path.getsize(effective_srt_path) > 0:
                             try:
                                 tmp_sub_out = os.path.join(self.out_dir, f'{uuid.uuid4()}_subpass.mp4')
                                 burn_subtitles_postprocess(
@@ -362,11 +391,11 @@ class Worker(QThread):
                                     except Exception:
                                         pass
                                     logging.exception('Postprocess subtitle burn failed (plain)')
-                        elif subtitle_mode != 'none':
+                        elif subtitle_mode not in ['none', 'whisper']:
                             self.status_update.emit('Субтитры пустые/некорректные, вшивание пропущено.')
                         
                         # Собираем текст из субтитров для автоматического названия видео
-                        if effective_srt_path and os.path.exists(effective_srt_path):
+                        if subtitle_mode == 'srt_file' and effective_srt_path and os.path.exists(effective_srt_path):
                             try:
                                 srt_text = self._extract_text_from_srt(effective_srt_path)
                                 if srt_text:

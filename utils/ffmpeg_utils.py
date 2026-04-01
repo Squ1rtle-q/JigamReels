@@ -559,6 +559,112 @@ def remove_silence_from_video(
     return output_path
 
 
+def _escape_drawtext_text(raw_text: str) -> str:
+    escaped = raw_text.replace('\\', '\\\\')
+    escaped = escaped.replace(':', '\\:')
+    escaped = escaped.replace('\'', "\\'")
+    escaped = escaped.replace('%', '%%')
+    escaped = escaped.replace('\n', '\\n')
+    return escaped
+
+
+def render_one_word_animation(
+    input_path: str,
+    output_path: str,
+    words: List[Dict],
+    fontfile: str = 'TheBoldFont.ttf',
+    base_font_size: int = 70,
+    zoom_font_size: int = 90,
+    y_offset: int = 200
+) -> str:
+    """
+    Рендерит анимацию субтитров «одно слово на экране» с эффектом zoom.
+
+    Args:
+        input_path: исходный видеофайл
+        output_path: выходной файл
+        words: список слов с таймкодами [{'word': str, 'start': float, 'end': float}, ...]
+        fontfile: путь до шрифта
+        base_font_size: начальный размер
+        zoom_font_size: размер в пике
+        y_offset: смещение по вертикали относительно центра
+
+    Returns:
+        output_path
+    """
+    if not words:
+        # Нечего рендерить, копируем вход в выход
+        shutil.copyfile(input_path, output_path)
+        return output_path
+
+    # Ограничение на число фильтров в командной строке
+    use_filter_script = len(words) > 80
+
+    def build_filter_chain(words_list):
+        chain = ''
+        prev = '[0:v]'
+        for idx, item in enumerate(words_list):
+            if not item.get('word') or item.get('start') is None or item.get('end') is None:
+                continue
+            start = float(item['start'])
+            end = float(item['end'])
+            word = _escape_drawtext_text(item['word'])
+            fontsize_expr = f"if(lt(t,{start + 0.1:.3f}),{base_font_size} + ({zoom_font_size} - {base_font_size})*(t-{start:.3f})/0.1,{zoom_font_size})"
+            enable_expr = f"between(t,{start:.3f},{end:.3f})"
+            label = f"[v{idx}]"
+            drawtext = (
+                f"{prev}drawtext=fontfile='{fontfile}':text='{word}':x=(W-tw)/2:y=(H-th)/2+{y_offset}"
+                f":fontcolor=white:borderw=3:bordercolor=black:enable='{enable_expr}'"
+                f":fontsize={fontsize_expr}{label};"
+            )
+            chain += drawtext
+            prev = label
+
+        return chain, prev
+
+    filter_complex, final_label = build_filter_chain(words)
+
+    if use_filter_script:
+        with tempfile.NamedTemporaryFile('w', delete=False, suffix='.txt', encoding='utf-8') as ff:
+            ff.write(filter_complex)
+            filter_script_path = ff.name
+        ffmpeg_cmd = [
+            '-y',
+            '-i', input_path,
+            '-filter_script', filter_script_path,
+            '-map', final_label,
+            '-map', '0:a?',
+            '-c:v', 'libx264',
+            '-preset', 'veryfast',
+            '-crf', '23',
+            '-c:a', 'aac',
+            '-b:a', '192k',
+            output_path
+        ]
+    else:
+        ffmpeg_cmd = [
+            '-y',
+            '-i', input_path,
+            '-filter_complex', filter_complex,
+            '-map', final_label,
+            '-map', '0:a?',
+            '-c:v', 'libx264',
+            '-preset', 'veryfast',
+            '-crf', '23',
+            '-c:a', 'aac',
+            '-b:a', '192k',
+            output_path
+        ]
+
+    try:
+        run_ffmpeg(ffmpeg_cmd, input_path)
+    finally:
+        if use_filter_script and os.path.exists(filter_script_path):
+            os.remove(filter_script_path)
+
+    return output_path
+
+
 def detect_viral_moments(path: str, clip_duration: int = 15, max_clips: int = 3) -> List[Tuple[float, float]]:
     """
     Находит самые динамичные/виральные участки по комбинации:
