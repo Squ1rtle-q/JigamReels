@@ -603,29 +603,39 @@ def render_one_word_animation(
     def build_filter_chain(words_list):
         chain = ''
         prev = '[0:v]'
-        last_label = prev
-        valid_index = -1
+        current_out_label = prev
 
-        for idx, item in enumerate(words_list):
+        for item in words_list:
             if not item.get('word') or item.get('start') is None or item.get('end') is None:
                 continue
-            valid_index += 1
+
+            # определяем следующий корректный индекс из предыдущей выходной метки
+            if current_out_label.startswith('[v') and current_out_label.endswith(']'):
+                try:
+                    base_idx = int(current_out_label[2:-1])
+                except ValueError:
+                    base_idx = -1
+            else:
+                base_idx = -1
+
+            next_idx = base_idx + 1
+            current_out_label = f"[v{next_idx}]"
+
             start = float(item['start'])
             end = float(item['end'])
             word = _escape_drawtext_text(item['word'])
             fontsize_expr = f"if(lt(t,{start + 0.1:.3f}),{base_font_size} + ({zoom_font_size} - {base_font_size})*(t-{start:.3f})/0.1,{zoom_font_size})"
             enable_expr = f"between(t,{start:.3f},{end:.3f})"
-            label = f"[v{valid_index}]"
+
             drawtext = (
                 f"{prev}drawtext=fontfile='{fontfile}':text='{word}':x=(W-tw)/2:y=(H-th)/2+{y_offset}"
                 f":fontcolor=white:borderw=3:bordercolor=black:enable='{enable_expr}'"
-                f":fontsize={fontsize_expr}{label};"
+                f":fontsize={fontsize_expr}{current_out_label};"
             )
             chain += drawtext
-            prev = label
-            last_label = label
+            prev = current_out_label
 
-        return chain, last_label
+        return chain, current_out_label
 
     filter_complex, final_label = build_filter_chain(words)
 
@@ -667,14 +677,24 @@ def render_one_word_animation(
             output_path
         ]
 
+    print(f"DEBUG: Words count: {len(words)}, Final Label: {final_label}")
+    print(f"DEBUG: FFmpeg command: {ffmpeg_cmd}")
     logging.debug(f"render_one_word_animation: final map label {final_label}, total words {len(words)}")
     logging.debug(f"render_one_word_animation: ffmpeg_cmd = {ffmpeg_cmd}")
 
     try:
         run_ffmpeg(ffmpeg_cmd, input_path)
+    except Exception as ff_err:
+        print(f"WARNING: render_one_word_animation failed (fallback to copy): {ff_err}")
+        logging.warning(f"render_one_word_animation failed: {ff_err}")
+        shutil.copyfile(input_path, output_path)
+        return output_path
     finally:
         if use_filter_script and os.path.exists(filter_script_path):
-            os.remove(filter_script_path)
+            try:
+                os.remove(filter_script_path)
+            except Exception:
+                pass
 
     return output_path
 

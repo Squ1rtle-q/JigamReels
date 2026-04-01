@@ -408,60 +408,42 @@ class Worker(QThread):
                     # Генерируем умное название на основе полной транскрипции
                     if full_transcription_text and self.output_paths:
                         try:
-                            combined_text = ' '.join(full_transcription_text)
-                            if combined_text.strip():
-                                self.status_update.emit('Генерируем название видео через ИИ...')
-                                smart_title = generate_smart_title(combined_text)
+                            # Полный отказ от g4f: используем локальный fallback по имени файла + дата-время.
+                            now_label = datetime.now().strftime('%Y%m%d_%H%M%S')
+                            smart_title = f"{name_part}_{now_label}"
 
-                                valid_title = False
-                                if isinstance(smart_title, str) and smart_title.strip():
-                                    cleaned_test = smart_title.strip().lower()
-                                    if cleaned_test not in ['video', ''] and 'pollinations legacy' not in cleaned_test and 'deprecated' not in cleaned_test:
-                                        valid_title = True
+                            if self.censor_words:
+                                smart_title = censor_words_in_text(smart_title, self.censor_words, '*')
 
-                                if not valid_title:
-                                    # Фоллбек: на основе имени файла
-                                    fallback_title = name_part.replace('_', ' ').replace('-', ' ').strip()
-                                    if fallback_title:
-                                        smart_title = fallback_title
-                                        logging.warning('Smart title g4f некорректен, используем fallback из имени файла')
-                                    else:
-                                        smart_title = 'Video'
+                            clean_title = sanitize_title_for_filename(smart_title)
+                            clean_title = safe_filename(clean_title)
 
-                                # Применяем цензуру к названию
-                                if self.censor_words:
-                                    smart_title = censor_words_in_text(smart_title, self.censor_words, '*')
+                            # Переименовываем основной файл (первый или единственный)
+                            if self.output_paths:
+                                original_output_path = self.output_paths[0]
+                                original_dir = os.path.dirname(original_output_path)
+                                _, ext = os.path.splitext(original_output_path)
+                                ext = ext.strip()  # Убираем случайные пробелы
 
-                                # Очищаем название для использования в имени файла
-                                clean_title = sanitize_title_for_filename(smart_title)
-                                clean_title = safe_filename(clean_title)
+                                # Извлекаем только время (часы-минуты) из file_unique
+                                # file_unique формат: 2025-02-26_18-45-30_abc12345
+                                time_part = file_unique.split('_')[1][:5] if '_' in file_unique else '00-00'
 
-                                # Переименовываем основной файл (первый или единственный)
-                                if self.output_paths:
-                                    original_output_path = self.output_paths[0]
-                                    original_dir = os.path.dirname(original_output_path)
-                                    _, ext = os.path.splitext(original_output_path)
-                                    ext = ext.strip()  # Убираем случайные пробелы
-                                        
-                                    # Извлекаем только время (часы-минуты) из file_unique
-                                    # file_unique формат: 2025-02-26_18-45-30_abc12345
-                                    time_part = file_unique.split('_')[1][:5] if '_' in file_unique else '00-00'
+                                # Формируем новое имя через пробелы (без лишних replace)
+                                # clean_title уже содержит пробелы, нужно просто их сохранить
+                                base_new_name = f'{clean_title} ({time_part}){ext}'
+                                # Убираем множественные пробелы если они появились
+                                base_new_name = ' '.join(base_new_name.split())
+                                new_output_path = os.path.join(original_dir, base_new_name)
 
-                                    # Формируем новое имя через пробелы (без лишних replace)
-                                    # clean_title уже содержит пробелы, нужно просто их сохранить
-                                    base_new_name = f'{clean_title} ({time_part}){ext}'
-                                    # Убираем множественные пробелы если они появились
-                                    base_new_name = ' '.join(base_new_name.split())
-                                    new_output_path = os.path.join(original_dir, base_new_name)
-
-                                    try:
-                                        if os.path.exists(original_output_path):
-                                            os.replace(original_output_path, new_output_path)
-                                            self.output_paths[0] = new_output_path
-                                            self.status_update.emit(f'Файл переименован: {clean_title}')
-                                            logging.info(f'Видео переименовано на: {base_new_name}')
-                                    except Exception as rename_err:
-                                        logging.warning(f'Не удалось переименовать файл: {rename_err}')
+                                try:
+                                    if os.path.exists(original_output_path):
+                                        os.replace(original_output_path, new_output_path)
+                                        self.output_paths[0] = new_output_path
+                                        self.status_update.emit(f'Файл переименован: {clean_title}')
+                                        logging.info(f'Видео переименовано на: {base_new_name}')
+                                except Exception as rename_err:
+                                    logging.warning(f'Не удалось переименовать файл: {rename_err}')
                         except Exception as title_err:
                             logging.warning(f'Ошибка при генерации названия: {title_err}')
                     
