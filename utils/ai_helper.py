@@ -45,26 +45,36 @@ def generate_smart_title(transcription_text: str, timeout: int = 10) -> Optional
         
         # Отправляем запрос к AI через g4f с автоматическим списком провайдеров
         # Игнорируем проблемные провайдеры
-        response = g4f.ChatCompletion.create(
-            model="gpt-4o",
-            messages=[{
+        provider = None
+        if hasattr(g4f, 'Provider'):
+            provider = getattr(g4f.Provider, 'Bing', None) or getattr(g4f.Provider, 'Blackbox', None)
+
+        request_kwargs = {
+            'model': 'gpt-4o',
+            'messages': [{
                 'role': 'user',
                 'content': prompt
             }],
-            stream=False,
-            ignored=["Pollinations", "GigaChat", "Blackbox"],
-            timeout=timeout
-        )
+            'stream': False,
+            'ignored': ['Pollinations', 'GigaChat', 'Blackbox'],
+            'timeout': timeout
+        }
+
+        if provider is not None:
+            request_kwargs['provider'] = provider
+
+        response = g4f.ChatCompletion.create(**request_kwargs)
+
         
         # Извлекаем текст из ответа
         title = response
-        
+
         # Проверяем на ошибочные ключевые слова
-        error_keywords = ['error', 'authentication', 'api key', 'type']
+        error_keywords = ['error', 'authentication', 'api key', 'type', 'pollinations legacy', 'deprecated']
         if isinstance(title, str) and any(keyword in title.lower() for keyword in error_keywords):
-            logging.warning(f"ИИ вернул ошибку: {title[:100]}")
+            logging.warning(f"ИИ вернул ошибку / устаревший API: {title[:120]}")
             return None
-        
+
         # Очищаем заголовок: убираем звездочки (если ИИ вернул **Текст**)
         title = title.replace('*', '')
         # Убираем кавычки, точки, лишние пробелы

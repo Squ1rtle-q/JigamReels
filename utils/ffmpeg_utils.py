@@ -603,15 +603,19 @@ def render_one_word_animation(
     def build_filter_chain(words_list):
         chain = ''
         prev = '[0:v]'
+        last_label = prev
+        valid_index = -1
+
         for idx, item in enumerate(words_list):
             if not item.get('word') or item.get('start') is None or item.get('end') is None:
                 continue
+            valid_index += 1
             start = float(item['start'])
             end = float(item['end'])
             word = _escape_drawtext_text(item['word'])
             fontsize_expr = f"if(lt(t,{start + 0.1:.3f}),{base_font_size} + ({zoom_font_size} - {base_font_size})*(t-{start:.3f})/0.1,{zoom_font_size})"
             enable_expr = f"between(t,{start:.3f},{end:.3f})"
-            label = f"[v{idx}]"
+            label = f"[v{valid_index}]"
             drawtext = (
                 f"{prev}drawtext=fontfile='{fontfile}':text='{word}':x=(W-tw)/2:y=(H-th)/2+{y_offset}"
                 f":fontcolor=white:borderw=3:bordercolor=black:enable='{enable_expr}'"
@@ -619,10 +623,17 @@ def render_one_word_animation(
             )
             chain += drawtext
             prev = label
+            last_label = label
 
-        return chain, prev
+        return chain, last_label
 
     filter_complex, final_label = build_filter_chain(words)
+
+    if final_label == '[0:v]':
+        # Нечего рендерить в drawtext, просто копируем исходник
+        logging.info('render_one_word_animation: слова отсутствуют, копирование input->output')
+        shutil.copyfile(input_path, output_path)
+        return output_path
 
     if use_filter_script:
         with tempfile.NamedTemporaryFile('w', delete=False, suffix='.txt', encoding='utf-8') as ff:
@@ -655,6 +666,9 @@ def render_one_word_animation(
             '-b:a', '192k',
             output_path
         ]
+
+    logging.debug(f"render_one_word_animation: final map label {final_label}, total words {len(words)}")
+    logging.debug(f"render_one_word_animation: ffmpeg_cmd = {ffmpeg_cmd}")
 
     try:
         run_ffmpeg(ffmpeg_cmd, input_path)
