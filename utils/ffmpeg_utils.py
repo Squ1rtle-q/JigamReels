@@ -410,6 +410,155 @@ def get_video_duration(path: str) -> float:
         return 0
 
 
+def _merge_intervals(intervals: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
+    if not intervals:
+        return []
+
+    sorted_intervals = sorted(intervals, key=lambda x: x[0])
+    merged = [sorted_intervals[0]]
+
+    for start, end in sorted_intervals[1:]:
+        last_start, last_end = merged[-1]
+        if start <= last_end + 1e-4:
+            merged[-1] = (last_start, max(last_end, end))
+        else:
+            merged.append((start, end))
+
+    return merged
+
+
+def _parse_silencedetect_output(stderr: str) -> List[Tuple[float, float]]:
+    silence_ranges = []
+    current_silence_start = None
+
+    for line in stderr.splitlines():
+        line = line.strip()
+        # FFmpeg silencedetect output contains строку 'silence_start:' и 'silence_end:'
+        if 'silence_start:' in line:
+            try:
+                current_silence_start = float(line.split('silence_start:')[1].strip().split()[0])
+            except Exception:
+                current_silence_start = None
+        elif 'silence_end:' in line:
+            try:
+                parts = line.split('silence_end:')[1].strip().split()
+                silence_end = float(parts[0])
+                if current_silence_start is not None and silence_end >= current_silence_start:
+                    silence_ranges.append((current_silence_start, silence_end))
+                current_silence_start = None
+            except Exception:
+                continue
+
+    return silence_ranges
+
+
+def remove_silence_from_video(
+    input_path: str,
+    output_path: str,
+    silence_db: float = -30.0,
+    silence_duration: float = 0.5,
+    padding: float = 0.1
+) -> str:
+    """
+    Удаляет паузы из видео с помощью FFmpeg silencedetect + trim/atrim/concat.
+
+    Args:
+        input_path: Исходный видеофайл.
+        output_path: Результат (новый файл).
+        silence_db: Уровень тишины в dB (по умолчанию -30dB).
+        silence_duration: Минимальная длительность паузы, которую нужно удалить (в секундах).
+        padding: Запас вокруг речи (по 0.1 сек до и после каждого сегмента).
+
+    Returns:
+        Путь к итоговому файлу.
+    """
+    import shutil
+
+    if os.path.abspath(input_path) == os.path.abspath(output_path):
+        raise ValueError('input_path и output_path не могут совпадать для удаления тишины')
+
+    duration = get_video_duration(input_path)
+    if duration <= 0:
+        # fallback: просто копируем файл, если не удалось получить длительность
+        shutil.copyfile(input_path, output_path)
+        return output_path
+
+    cmd = [
+        FFMPEG_PATH_EFFECTIVE,
+        '-hide_banner',
+        '-nostats',
+        '-i', input_path,
+        '-af', f'silencedetect=n={silence_db}dB:d={silence_duration}',
+        '-f', 'null',
+        '-'
+    ]
+
+    proc = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8', errors='replace')
+    stderr = proc.stderr or ''
+
+    silences = _parse_silencedetect_output(stderr)
+
+    if not silences:
+        # нет тишины для удаления
+        shutil.copyfile(input_path, output_path)
+        return output_path
+
+    # Формируем сегменты речи
+    speak_segments = []
+    current = 0.0
+    for silence_start, silence_end in silences:
+        if silence_start > current + 1e-4:
+            speak_segments.append((current, silence_start))
+        current = max(current, silence_end)
+
+    if current < duration - 1e-4:
+        speak_segments.append((current, duration))
+
+    # Применяем padding и ограничиваем границы
+    padded_segments = []
+    for start, end in speak_segments:
+        start = max(0.0, start - padding)
+        end = min(duration, end + padding)
+        if end > start + 0.01:
+            padded_segments.append((start, end))
+
+    padded_segments = _merge_intervals(padded_segments)
+
+    if not padded_segments:
+        # если всё тихо - оставляем первые 0.5 сек
+        padded_segments = [(0.0, min(0.5, duration))]
+
+    # Построение filter_complex для соединения сегментов
+    filter_parts = []
+    concat_labels = []
+
+    for idx, (start, end) in enumerate(padded_segments):
+        filter_parts.append(f"[0:v]trim=start={start:.3f}:end={end:.3f},setpts=PTS-STARTPTS[v{idx}]")
+        filter_parts.append(f"[0:a]atrim=start={start:.3f}:end={end:.3f},asetpts=PTS-STARTPTS[a{idx}]")
+        concat_labels.append(f"[v{idx}][a{idx}]")
+
+    concat_chain = ''.join(concat_labels) + f"concat=n={len(padded_segments)}:v=1:a=1[outv][outa]"
+    filter_complex = ';'.join(filter_parts + [concat_chain])
+
+    ffmpeg_cmd = [
+        '-y',
+        '-i', input_path,
+        '-filter_complex', filter_complex,
+        '-map', '[outv]',
+        '-map', '[outa]',
+        '-c:v', 'libx264',
+        '-preset', 'veryfast',
+        '-crf', '23',
+        '-c:a', 'aac',
+        '-b:a', '192k',
+        output_path
+    ]
+
+    run_ffmpeg(ffmpeg_cmd, input_path)
+
+    return output_path
+
+
 def detect_viral_moments(path: str, clip_duration: int = 15, max_clips: int = 3) -> List[Tuple[float, float]]:
     """
     Находит самые динамичные/виральные участки по комбинации:

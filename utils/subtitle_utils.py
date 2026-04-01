@@ -222,13 +222,9 @@ def generate_srt_from_whisper(
                 c_end = seg_end if idx == chunk_count - 1 else min(seg_end, c_start + chunk_dur)
                 # Очищение текста от лишних пробелов и прижание пунктуации
                 chunk_text = ' '.join(chunk)
-                # Жесткая очистка перед записью
-                # Удаляем пробелы ПЕРЕД знаками препинания
-                chunk_text = re.sub(r'\s+([,.!?])', r'\1', chunk_text)
-                # Гарантируем ровно один пробел ПОСЛЕ знаков препинания (если там не конец строки)
-                chunk_text = re.sub(r'([,.!?])(?!\s|$)', r'\1 ', chunk_text)
-                # Убираем двойные пробелы
-                chunk_text = re.sub(r'\s+', ' ', chunk_text).strip()
+                chunk_text = clean_subtitle_text(chunk_text)
+                if censor_words:
+                    chunk_text = censor_words_in_text(chunk_text, censor_words, '*')
                 srt_content += f"{sub_index}\n"
                 srt_content += f"{_format_time(c_start)} --> {_format_time(c_end)}\n"
                 srt_content += f"{chunk_text}\n\n"
@@ -250,13 +246,9 @@ def generate_srt_from_whisper(
             
             # Объединяем слова в текст с чисткой пробелов
             text = ' '.join([word['word'] for word in chunk]).strip()
-            # Жесткая очистка перед записью
-            # Удаляем пробелы ПЕРЕД знаками препинания
-            text = re.sub(r'\s+([,.!?])', r'\1', text)
-            # Гарантируем ровно один пробел ПОСЛЕ знаков препинания (если там не конец строки)
-            text = re.sub(r'([,.!?])(?!\s|$)', r'\1 ', text)
-            # Убираем двойные пробелы
-            text = re.sub(r'\s+', ' ', text).strip()
+            text = clean_subtitle_text(text)
+            if censor_words:
+                text = censor_words_in_text(text, censor_words, '*')
             
             # Добавляем субтитр в SRT формате
             srt_content += f"{sub_index}\n"

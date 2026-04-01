@@ -17,6 +17,7 @@ from utils.ffmpeg_utils import (
     burn_subtitles_postprocess,
     get_video_dimensions,
     reels_letterbox_vertical_inset_px,
+    remove_silence_from_video,
 )
 from utils.subtitle_utils import extract_audio, generate_srt_from_whisper, build_segment_srt, censor_words_in_text
 from utils.ai_helper import generate_smart_title, sanitize_title_for_filename
@@ -260,6 +261,24 @@ class Worker(QThread):
                             trim_start=seg_start,
                             trim_duration=seg_duration
                         )
+
+                        # Удаляем тишину из готового фрагмента (Jump Cut)
+                        try:
+                            self.status_update.emit('Удаление тишины из ролика (Jump Cut)...')
+                            trimmed_clip = os.path.join(tempfile.gettempdir(), f'{uuid.uuid4()}_jumpcut.mp4')
+                            remove_silence_from_video(
+                                input_path=current_out_file_path,
+                                output_path=trimmed_clip,
+                                silence_db=-30.0,
+                                silence_duration=0.5,
+                                padding=0.1
+                            )
+                            if os.path.exists(trimmed_clip):
+                                os.remove(current_out_file_path)
+                                os.replace(trimmed_clip, current_out_file_path)
+                                self.status_update.emit('Тишина удалена. Продолжаем обработку.')
+                        except Exception as silence_err:
+                            logging.warning(f'Не удалось выполнить удаление тишины: {silence_err}')
 
                         # Этап 2: отдельное распознавание/вшивание субтитров в уже нарезанный файл.
                         effective_srt_path = None
