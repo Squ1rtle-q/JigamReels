@@ -476,9 +476,9 @@ def _parse_silencedetect_output(stderr: str) -> List[Tuple[float, float]]:
 def remove_silence_from_video(
     input_path: str,
     output_path: str,
-    silence_db: float = -30.0,
-    silence_duration: float = 0.5,
-    padding: float = 0.1
+    silence_db: float = -35.0,
+    silence_duration: float = 1.0,
+    padding: float = 0.3
 ) -> str:
     """
     Удаляет паузы из видео с помощью FFmpeg silencedetect + trim/atrim/concat.
@@ -554,8 +554,21 @@ def remove_silence_from_video(
     concat_labels = []
 
     for idx, (start, end) in enumerate(padded_segments):
-        filter_parts.append(f"[0:v]trim=start={start:.3f}:end={end:.3f},setpts=PTS-STARTPTS[v{idx}]")
-        filter_parts.append(f"[0:a]atrim=start={start:.3f}:end={end:.3f},asetpts=PTS-STARTPTS[a{idx}]")
+        seg_duration = max(0.0, end - start)
+        fade_duration = min(0.25, seg_duration / 5.0)
+        if fade_duration > seg_duration / 2.0:
+            fade_duration = seg_duration / 2.0
+
+        video_filter = f"trim=start={start:.3f}:end={end:.3f},setpts=PTS-STARTPTS"
+        audio_filter = f"atrim=start={start:.3f}:end={end:.3f},asetpts=PTS-STARTPTS"
+
+        if fade_duration >= 0.05:
+            fade_start = max(seg_duration - fade_duration, 0.0)
+            video_filter += f",fade=t=in:st=0:d={fade_duration:.3f},fade=t=out:st={fade_start:.3f}:d={fade_duration:.3f}"
+            audio_filter += f",afade=t=in:st=0:d={fade_duration:.3f},afade=t=out:st={fade_start:.3f}:d={fade_duration:.3f}"
+
+        filter_parts.append(f"[0:v]{video_filter}[v{idx}]")
+        filter_parts.append(f"[0:a]{audio_filter}[a{idx}]")
         concat_labels.append(f"[v{idx}][a{idx}]")
 
     concat_chain = ''.join(concat_labels) + f"concat=n={len(padded_segments)}:v=1:a=1[outv][outa]"

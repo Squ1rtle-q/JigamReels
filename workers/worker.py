@@ -186,6 +186,7 @@ class Worker(QThread):
             full_srt_path = None
             crop_filter = None
             segment_srt_paths = []
+            segment_titles = []
             full_transcription_text = []  # Для сбора текста из всех сегментов транскрипции
             smart_title = None  # Автоматически сгенерированное название
             
@@ -232,14 +233,14 @@ class Worker(QThread):
                         # Приводим путь к нормальному формату и убираем смешанные слэши
                         current_out_file_path = os.path.normpath(current_out_file_path)
 
-                        # Этап 1: обрабатываем/режем БЕЗ субтитров.
+                        # Этап 1: обрабатываем/режем БЕЗ баннера и без субтитров.
                         process_single(
                             in_path=in_file_path,
                             out_path=current_out_file_path,
                             filters=self.filters,
                             zoom_p=current_zoom,
                             speed_p=current_speed,
-                            overlay_file=self.overlay_file,
+                            overlay_file=None,
                             overlay_alignment=self.overlay_alignment,
                             overlay_margin_v=self.overlay_margin_v,
                             overlay_margin_lr=self.overlay_margin_lr,
@@ -271,9 +272,9 @@ class Worker(QThread):
                             remove_silence_from_video(
                                 input_path=current_out_file_path,
                                 output_path=trimmed_clip,
-                                silence_db=-30.0,
-                                silence_duration=0.5,
-                                padding=0.1
+                                silence_db=-35.0,
+                                silence_duration=1.0,
+                                padding=0.3
                             )
                             if os.path.exists(trimmed_clip):
                                 # Перемещение файла возможное между дисками C: и D:
@@ -287,6 +288,46 @@ class Worker(QThread):
                                 self.status_update.emit('Тишина удалена. Продолжаем обработку.')
                         except Exception as silence_err:
                             logging.warning(f'Не удалось выполнить удаление тишины: {silence_err}')
+
+                        # Этап 1.5: наложение баннера после Jump Cut, чтобы баннер не обрезался.
+                        if self.overlay_file and os.path.exists(current_out_file_path):
+                            try:
+                                self.status_update.emit('Накладываем баннер после Jump Cut...')
+                                banner_tmp = os.path.join(tempfile.gettempdir(), f'{uuid.uuid4()}_banner.mp4')
+                                process_single(
+                                    in_path=current_out_file_path,
+                                    out_path=banner_tmp,
+                                    filters=[],
+                                    zoom_p=100,
+                                    speed_p=100,
+                                    overlay_file=self.overlay_file,
+                                    overlay_alignment=self.overlay_alignment,
+                                    overlay_margin_v=self.overlay_margin_v,
+                                    overlay_margin_lr=self.overlay_margin_lr,
+                                    overlay_scale_p=self.overlay_scale_p,
+                                    overlay_chromakey=self.overlay_chromakey,
+                                    overlay_chromakey_color=self.overlay_chromakey_color,
+                                    overlay_chromakey_similarity=self.overlay_chromakey_similarity,
+                                    overlay_chromakey_blend=self.overlay_chromakey_blend,
+                                    output_format=self.output_format,
+                                    blur_background=False,
+                                    mute_audio=False,
+                                    strip_metadata=self.strip_metadata,
+                                    codec=self.codec,
+                                    srt_path=None,
+                                    subtitle_style=None,
+                                    crop_filter=None,
+                                    overlay_audio_path=None,
+                                    original_volume=1.0,
+                                    overlay_volume=1.0,
+                                    progress_callback=self.file_progress.emit,
+                                )
+                                if os.path.exists(banner_tmp):
+                                    os.remove(current_out_file_path)
+                                    os.replace(banner_tmp, current_out_file_path)
+                                    self.status_update.emit('Баннер наложен.')
+                            except Exception as banner_err:
+                                logging.warning(f'Не удалось наложить баннер после Jump Cut: {banner_err}')
 
                         # Этап 2: отдельное распознавание/вшивание субтитров в уже нарезанный файл.
                         effective_srt_path = None
@@ -374,61 +415,55 @@ class Worker(QThread):
                             self.status_update.emit('Субтитры пустые/некорректные, вшивание пропущено.')
                         
                         # Собираем текст из субтитров для автоматического названия видео
+                        segment_title = None
                         if effective_srt_path and os.path.exists(effective_srt_path):
                             try:
                                 srt_text = self._extract_text_from_srt(effective_srt_path)
                                 if srt_text:
                                     full_transcription_text.append(srt_text)
+                                    title_candidate = generate_smart_title(srt_text)
+                                    if title_candidate and title_candidate.lower() != 'video':
+                                        if self.censor_words:
+                                            title_candidate = censor_words_in_text(title_candidate, self.censor_words, '*')
+                                        title_candidate = sanitize_title_for_filename(title_candidate)
+                                        title_candidate = safe_filename(title_candidate)
+                                        segment_title = title_candidate
                             except Exception as srt_read_err:
                                 logging.warning(f'Не удалось прочитать текст из SRT: {srt_read_err}')
-                        
+
+                        if not segment_title:
+                            segment_title = f'{name_part} #{seg_i}'
+                        segment_titles.append(segment_title)
                         self.output_paths.append(current_out_file_path)
                     
-                    # Генерируем умное название на основе полной транскрипции
-                    if full_transcription_text and self.output_paths:
-                        try:
-                            combined_text = ' '.join(full_transcription_text)
-                            if combined_text.strip():
-                                self.status_update.emit('Генерируем название видео через ИИ...')
-                                smart_title = generate_smart_title(combined_text)
-                                
-                                # Проверяем, что название успешно сгенерировано (не None и не "Video")
-                                if smart_title and smart_title.lower() != 'video':
-                                    # Применяем цензуру к названию
-                                    if self.censor_words:
-                                        smart_title = censor_words_in_text(smart_title, self.censor_words, '*')
-                                    
-                                    # Очищаем название для использования в имени файла
-                                    clean_title = sanitize_title_for_filename(smart_title)
-                                    clean_title = safe_filename(clean_title)
-                                    
-                                    # Переименовываем все выходные файлы (если несколько сегментов/файлов)
-                                    if self.output_paths:
-                                        time_part = file_unique.split('_')[1][:5] if '_' in file_unique else '00-00'
+                    # Переименовываем каждый сегмент по своему индивидуальному названию
+                    if self.output_paths:
+                        time_part = file_unique.split('_')[1] if '_' in file_unique else '00-00-00'
+                        unique_part = file_unique.split('_')[-1][:5] if '_' in file_unique else file_unique
 
-                                        for idx, original_output_path in enumerate(list(self.output_paths)):
-                                            original_dir = os.path.dirname(original_output_path)
-                                            _, ext = os.path.splitext(original_output_path)
-                                            ext = ext.strip()  # Убираем случайные пробелы
+                        for idx, original_output_path in enumerate(list(self.output_paths)):
+                            original_dir = os.path.dirname(original_output_path)
+                            _, ext = os.path.splitext(original_output_path)
+                            ext = ext.strip()  # Убираем случайные пробелы
+                            title_for_file = segment_titles[idx] if idx < len(segment_titles) else name_part
+                            title_for_file = title_for_file.strip() or name_part
+                            title_for_file = safe_filename(title_for_file)
+                            if len(self.output_paths) == 1:
+                                base_new_name = f'{title_for_file} ({time_part}_{unique_part}){ext}'
+                            else:
+                                base_new_name = f'{title_for_file} ({time_part}_{unique_part})_{idx + 1}{ext}'
 
-                                            if len(self.output_paths) == 1:
-                                                base_new_name = f'{clean_title} ({time_part}){ext}'
-                                            else:
-                                                base_new_name = f'{clean_title} ({time_part})_{idx + 1}{ext}'
+                            base_new_name = ' '.join(base_new_name.split())
+                            new_output_path = os.path.join(original_dir, base_new_name)
 
-                                            base_new_name = ' '.join(base_new_name.split())
-                                            new_output_path = os.path.join(original_dir, base_new_name)
-
-                                            try:
-                                                if os.path.exists(original_output_path):
-                                                    os.replace(original_output_path, new_output_path)
-                                                    self.output_paths[idx] = new_output_path
-                                                    self.status_update.emit(f'Файл переименован: {clean_title}')
-                                                    logging.info(f'Видео переименовано на: {base_new_name}')
-                                            except Exception as rename_err:
-                                                logging.warning(f'Не удалось переименовать файл: {rename_err}')
-                        except Exception as title_err:
-                            logging.warning(f'Ошибка при генерации названия: {title_err}')
+                            try:
+                                if os.path.exists(original_output_path):
+                                    os.replace(original_output_path, new_output_path)
+                                    self.output_paths[idx] = new_output_path
+                                    self.status_update.emit(f'Файл переименован: {title_for_file}')
+                                    logging.info(f'Видео переименовано на: {base_new_name}')
+                            except Exception as rename_err:
+                                logging.warning(f'Не удалось переименовать файл: {rename_err}')
                     
                     # Обновление общего прогресса (по исходным файлам)
                     self.progress.emit(i + 1, total_files)
