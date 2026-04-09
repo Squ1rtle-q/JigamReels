@@ -1,7 +1,36 @@
-"__pycache__/" 
-"*.pyc" 
-"build/" 
-"dist/" 
-"*.dll" 
-"cudnn*.dll" 
-"nvblas*.dll" 
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environments
+venv/
+env/
+.env
+
+# Build and Dist
+build/
+dist/
+*.spec
+
+# Windows/IDE
+.vscode/
+*.swp
+desktop.ini
+Thumbs.db
+
+# Binaries & Logs
+bin/*.exe
+*.exe
+*.dll
+*.log
+crash_log.log
+
+# Project specific
+temp_video/
+output/
+
+config/
+*.pickle
+*.json
+!requirements.txt

@@ -25,7 +25,7 @@ from PyQt5.QtGui import (
 )
 from PyQt5.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QListWidget, QAbstractItemView, QFileDialog, QSpinBox, QLineEdit,
+    QListWidget, QAbstractItemView, QFileDialog, QSpinBox, QDoubleSpinBox, QLineEdit,
     QMessageBox, QProgressBar, QComboBox, QGroupBox, QRadioButton,
     QButtonGroup, QCheckBox, QSplitter, QListWidgetItem, QTabWidget,
     QMenu, QFrame, QStackedWidget, QInputDialog, QPlainTextEdit, QColorDialog,
@@ -1051,6 +1051,33 @@ class ProcessingWidgetContent(QWidget):
         self.over_vol_slider.setDisabled(True)
         
         audio_tab_layout.addWidget(self.overlay_audio_group)
+        
+        # Группа Jump Cut
+        self.jumpcut_group = QGroupBox('Jump Cut (удаление тишины)')
+        jumpcut_layout = QVBoxLayout(self.jumpcut_group)
+        
+        self.jumpcut_enable_checkbox = QCheckBox('Включить Jump Cut')
+        self.jumpcut_enable_checkbox.setChecked(True)
+        jumpcut_layout.addWidget(self.jumpcut_enable_checkbox)
+        
+        jumpcut_params_layout = QHBoxLayout()
+        jumpcut_params_layout.addWidget(QLabel('Агрессивность:'))
+        self.jumpcut_aggressiveness_combo = QComboBox()
+        self.jumpcut_aggressiveness_combo.addItems(['Не сильно', 'Средне', 'Сильно'])
+        self.jumpcut_aggressiveness_combo.setCurrentIndex(1)  # Средне
+        jumpcut_params_layout.addWidget(self.jumpcut_aggressiveness_combo)
+        
+        jumpcut_params_layout.addSpacing(20)
+        jumpcut_params_layout.addWidget(QLabel('Затухание перехода (сек):'))
+        self.jumpcut_fade_spin = QDoubleSpinBox()
+        self.jumpcut_fade_spin.setRange(0.0, 1.0)
+        self.jumpcut_fade_spin.setValue(0.3)
+        self.jumpcut_fade_spin.setSingleStep(0.1)
+        jumpcut_params_layout.addWidget(self.jumpcut_fade_spin)
+        jumpcut_params_layout.addStretch()
+        jumpcut_layout.addLayout(jumpcut_params_layout)
+        
+        audio_tab_layout.addWidget(self.jumpcut_group)
         audio_tab_layout.addStretch()
         
         # === ВКЛАДКА ЦЕНЗУРА ===
@@ -2011,6 +2038,9 @@ class ProcessingWidgetContent(QWidget):
             'overlay_audio_file': self.overlay_audio_path_edit.text().strip(),
             'overlay_volume': self.over_vol_slider.value(),
             'strip_metadata': self.parent_window.settings_widget.strip_meta_checkbox.isChecked(),
+            'jumpcut_enabled': self.jumpcut_enable_checkbox.isChecked(),
+            'jumpcut_aggressiveness': self.jumpcut_aggressiveness_combo.currentIndex(),
+            'jumpcut_fade_duration': self.jumpcut_fade_spin.value(),
             'censor_subtitles': self.censor_subtitles_check.isChecked(),
             'censor_metadata': self.censor_metadata_check.isChecked(),
             'censor_list': self.get_censor_list()
@@ -2159,6 +2189,11 @@ class ProcessingWidgetContent(QWidget):
             bool(preset.get('strip_metadata', True))
         )
         
+        # Jump Cut настройки
+        self.jumpcut_enable_checkbox.setChecked(bool(preset.get('jumpcut_enabled', True)))
+        self.jumpcut_aggressiveness_combo.setCurrentIndex(int(preset.get('jumpcut_aggressiveness', 1)))
+        self.jumpcut_fade_spin.setValue(float(preset.get('jumpcut_fade_duration', 0.3)))
+        
         # Загружаем опции цензуры
         self.load_censor_settings_from_preset(preset)
 
@@ -2289,7 +2324,10 @@ class ProcessingWidgetContent(QWidget):
             viral_clips_enabled=self.viral_enable_checkbox.isChecked(),
             viral_clip_duration=self.viral_duration_spin.value(),
             viral_clip_count=self.viral_count_spin.value(),
-            censor_words=self.get_censor_list()
+            censor_words=self.get_censor_list(),
+            jumpcut_enabled=self.jumpcut_enable_checkbox.isChecked(),
+            jumpcut_aggressiveness=self.jumpcut_aggressiveness_combo.currentIndex(),
+            jumpcut_fade_duration=self.jumpcut_fade_spin.value()
         )
         
         # Подключение сигналов
@@ -2729,22 +2767,37 @@ class VideoUnicApp(QMainWindow):
     def _cleanup_temp_files(self):
         print('Cleaning up temporary files...')
         
+        import time
+        def safe_remove(file_path):
+            if os.path.exists(file_path):
+                for _ in range(3):
+                    try:
+                        os.remove(file_path)
+                        break
+                    except OSError as e:
+                        if _ == 2:
+                            print(f'Error removing temp file {file_path}: {e}')
+                        time.sleep(0.5)
+        
+        def safe_rmtree(dir_path):
+            if os.path.exists(dir_path):
+                for _ in range(3):
+                    try:
+                        shutil.rmtree(dir_path)
+                        break
+                    except OSError as e:
+                        if _ == 2:
+                            print(f'Error removing temp directory {dir_path}: {e}')
+                        time.sleep(0.5)
+        
         # Удаление временных файлов
         for f in self.temp_files:
-            try:
-                if os.path.exists(f):
-                    os.remove(f)
-            except OSError as e:
-                print(f'Error removing temp file {f}: {e}')
+            safe_remove(f)
         
         self.temp_files.clear()
         
         # Удаление временной директории
-        try:
-            if os.path.exists(self.temp_dir):
-                shutil.rmtree(self.temp_dir)
-        except OSError as e:
-            print(f'Error removing temp directory {self.temp_dir}: {e}')
+        safe_rmtree(self.temp_dir)
     
     def closeEvent(self, event):
         # Проверка на работающие потоки

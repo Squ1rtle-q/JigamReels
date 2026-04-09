@@ -68,7 +68,10 @@ class Worker(QThread):
         viral_clips_enabled: bool = False,
         viral_clip_duration: int = 15,
         viral_clip_count: int = 3,
-        censor_words: Optional[List[str]] = None
+        censor_words: Optional[List[str]] = None,
+        jumpcut_enabled: bool = True,
+        jumpcut_aggressiveness: int = 1,
+        jumpcut_fade_duration: float = 0.3
     ):
         super().__init__()
         
@@ -105,6 +108,9 @@ class Worker(QThread):
         self.viral_clip_duration = viral_clip_duration
         self.viral_clip_count = viral_clip_count
         self.censor_words = censor_words or []
+        self.jumpcut_enabled = jumpcut_enabled
+        self.jumpcut_aggressiveness = jumpcut_aggressiveness
+        self.jumpcut_fade_duration = jumpcut_fade_duration
         
         # Конвертация процентов в десятичные значения
         self.original_volume = original_volume / 100
@@ -139,6 +145,7 @@ class Worker(QThread):
     
     def run(self):
         """Основной метод обработки файлов"""
+        print(f"[DEBUG] Jumpcut агрессивность: {self.jumpcut_aggressiveness}, затухание: {self.jumpcut_fade_duration}")
         total_files = len(self.files)
         
         # Проверка наличия файлов
@@ -177,6 +184,11 @@ class Worker(QThread):
             # Уведомление о начале обработки файла
             self.file_processing.emit(base_name)
             self.file_progress.emit(0)
+            
+            # Проверка существования входного файла
+            if not os.path.exists(in_file_path):
+                self.error.emit(f'Входной файл не найден: {in_file_path}')
+                continue
             
             # Инициализация переменных
             srt_path = None
@@ -266,28 +278,37 @@ class Worker(QThread):
                         )
 
                         # Удаляем тишину из готового фрагмента (Jump Cut)
-                        try:
-                            self.status_update.emit('Удаление тишины из ролика (Jump Cut)...')
-                            trimmed_clip = os.path.join(tempfile.gettempdir(), f'{uuid.uuid4()}_jumpcut.mp4')
-                            remove_silence_from_video(
-                                input_path=current_out_file_path,
-                                output_path=trimmed_clip,
-                                silence_db=-35.0,
-                                silence_duration=1.0,
-                                padding=0.3
-                            )
-                            if os.path.exists(trimmed_clip):
-                                # Перемещение файла возможное между дисками C: и D:
-                                try:
-                                    shutil.move(trimmed_clip, current_out_file_path)
-                                except Exception:
-                                    # fallback на replace, если тот же диск
-                                    if os.path.exists(current_out_file_path):
-                                        os.remove(current_out_file_path)
-                                    os.replace(trimmed_clip, current_out_file_path)
-                                self.status_update.emit('Тишина удалена. Продолжаем обработку.')
-                        except Exception as silence_err:
-                            logging.warning(f'Не удалось выполнить удаление тишины: {silence_err}')
+                        if self.jumpcut_enabled:
+                            try:
+                                self.status_update.emit('Удаление тишины из ролика (Jump Cut)...')
+                                trimmed_clip = os.path.join(tempfile.gettempdir(), f'{uuid.uuid4()}_jumpcut.mp4')
+                                
+                                # Настройки jumpcut
+                                aggressiveness_levels = [-25.0, -35.0, -45.0]  # не сильно, средне, сильно
+                                silence_db = aggressiveness_levels[min(self.jumpcut_aggressiveness, 2)]
+                                padding = self.jumpcut_fade_duration
+                                
+                                remove_silence_from_video(
+                                    input_path=current_out_file_path,
+                                    output_path=trimmed_clip,
+                                    silence_db=silence_db,
+                                    silence_duration=1.0,
+                                    padding=padding
+                                )
+                                if os.path.exists(trimmed_clip):
+                                    # Перемещение файла возможное между дисками C: и D:
+                                    try:
+                                        shutil.move(trimmed_clip, current_out_file_path)
+                                    except Exception:
+                                        # fallback на replace, если тот же диск
+                                        if os.path.exists(current_out_file_path):
+                                            os.remove(current_out_file_path)
+                                        os.replace(trimmed_clip, current_out_file_path)
+                                    self.status_update.emit('Тишина удалена. Продолжаем обработку.')
+                            except Exception as silence_err:
+                                logging.warning(f'Не удалось выполнить удаление тишины: {silence_err}')
+                        else:
+                            self.status_update.emit('Jump Cut отключен. Продолжаем обработку.')
 
                         # Этап 1.5: наложение баннера после Jump Cut, чтобы баннер не обрезался.
                         if self.overlay_file and os.path.exists(current_out_file_path):
@@ -323,8 +344,12 @@ class Worker(QThread):
                                     progress_callback=self.file_progress.emit,
                                 )
                                 if os.path.exists(banner_tmp):
-                                    os.remove(current_out_file_path)
-                                    os.replace(banner_tmp, current_out_file_path)
+                                    try:
+                                        shutil.move(banner_tmp, current_out_file_path)
+                                    except Exception:
+                                        if os.path.exists(current_out_file_path):
+                                            os.remove(current_out_file_path)
+                                        os.replace(banner_tmp, current_out_file_path)
                                     self.status_update.emit('Баннер наложен.')
                             except Exception as banner_err:
                                 logging.warning(f'Не удалось наложить баннер после Jump Cut: {banner_err}')
@@ -337,6 +362,9 @@ class Worker(QThread):
                             self.status_update.emit(
                                 f'Распознавание речи для готового клипа {seg_i}/{len(segment_specs)}...'
                             )
+                            if not os.path.exists(current_out_file_path):
+                                logging.error(f'Output file not found for audio extraction: {current_out_file_path}')
+                                continue
                             extract_audio(current_out_file_path, seg_audio_path)
                             generate_srt_from_whisper(
                                 audio_path=seg_audio_path,
@@ -481,19 +509,28 @@ class Worker(QThread):
                     
             finally:
                 # Очистка временных файлов
-                if temp_audio_path and os.path.exists(temp_audio_path):
-                    os.remove(temp_audio_path)
-
+                import time
+                def safe_remove(file_path):
+                    if file_path and os.path.exists(file_path):
+                        for _ in range(3):
+                            try:
+                                os.remove(file_path)
+                                break
+                            except OSError as e:
+                                if _ == 2:
+                                    print(f'Error removing temp file {file_path}: {e}')
+                                time.sleep(0.5)
+                
+                safe_remove(temp_audio_path)
+                
                 for seg_audio in temp_audio_paths:
-                    if seg_audio and os.path.exists(seg_audio):
-                        os.remove(seg_audio)
+                    safe_remove(seg_audio)
                 
                 if srt_path and subtitle_mode == 'whisper' and os.path.exists(srt_path):
-                    os.remove(srt_path)
+                    safe_remove(srt_path)
                 
                 for seg_srt in segment_srt_paths:
-                    if seg_srt and os.path.exists(seg_srt):
-                        os.remove(seg_srt)
+                    safe_remove(seg_srt)
         
         # Завершение работы
         if self._is_running:
